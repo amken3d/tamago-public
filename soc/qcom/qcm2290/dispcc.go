@@ -1,4 +1,4 @@
-// Qualcomm QCM2290 display clock controller support
+// Qualcomm QCM2290 display clocks and power (GCC display branches, DISPCC)
 // https://github.com/usbarmory/tamago
 //
 // Copyright (c) the qcm2290 package authors
@@ -9,150 +9,255 @@
 package qcm2290
 
 import (
-	"errors"
+	"fmt"
+	"time"
 
 	"github.com/usbarmory/tamago/internal/reg"
 )
 
-// Display clock controller and GCC display-domain registers
-// (drivers/clk/qcom/dispcc-qcm2290.c, gcc-qcm2290.c). Only the clocks
-// the DSI link needs are driven here: the MDP/DPU clocks are D3.
+// Written from bmx's docs/display-spec.md (section references below
+// point at it); see docs/display-provenance.md for why it is the only
+// hardware documentation this driver was written from.
+
+// DISPCC_BASE is the display clock controller (§1).
+const DISPCC_BASE = 0x05f00000
+
+// Clock and power primitives (§2)
 const (
-	DISPCC_BASE = 0x05f00000
+	cbcrEnable = 1 << 0
+	cbcrOff    = 1 << 31
 
-	// MDSS GDSC power domain
-	dispccGDSCR   = 0x3000
-	gdscSWCollapse = 0
-	gdscPowerOn    = 31
+	rcgCmdUpdate = 1 << 0
+	rcgCfg       = 0x4 // CFG register, 4 bytes after CMD
 
-	// RCGs (cmd_rcgr; CFG at +4)
-	dispccPclk0CmdRCGR = 0x205c
-	dispccByte0CmdRCGR = 0x20a4
-	dispccByte0Div     = 0x20bc
-	dispccEsc0CmdRCGR  = 0x20c0
-	dispccAHBCmdRCGR   = 0x2154
+	gdscCollapse = 1 << 0
+	gdscPwrOn    = 1 << 31
 
-	// branch CBCRs
-	dispccPclk0CBCR      = 0x2004
-	dispccByte0CBCR      = 0x201c
-	dispccByte0IntfCBCR  = 0x2020
-	dispccEsc0CBCR       = 0x2024
-	dispccAHBCBCR        = 0x2044
-	dispccNonGDSCAHBCBCR = 0x4004
+	// clkPollTime bounds every branch, RCG and GDSC poll
+	clkPollTime = 10 * time.Millisecond
+)
 
-	// CFG_RCGR source selects (dispcc parent maps): the DSI0 PHY PLL
-	// byte/pixel outputs are source 1 on their RCGs; XO is source 0
-	cfgSrcDSI0PLL = 1 << 8
-	cfgSrcXODiv1  = 0<<8 | 1
+// pollTime polls addr until (value & mask) == want or the timeout
+// expires, without the scheduler (polled drivers, runtime may idle).
+func pollTime(addr, mask, want uint32, timeout time.Duration) bool {
+	start := time.Now()
 
-	// GCC display-domain branches
+	for {
+		if reg.Read(addr)&mask == want {
+			return true
+		}
+
+		if time.Since(start) > timeout {
+			return false
+		}
+	}
+}
+
+// rcgUpdate programs a root clock generator's CFG (source select bits
+// 10:8, divider 2 x div - 1 in bits 4:0) and commits it through the CMD
+// register, waiting for the hardware to clear the update bit (§2).
+func rcgUpdate(base, cmd, cfg uint32) error {
+	reg.Write(base+cmd+rcgCfg, cfg)
+	reg.Write(base+cmd, reg.Read(base+cmd)|rcgCmdUpdate)
+
+	if !pollTime(base+cmd, rcgCmdUpdate, 0, clkPollTime) {
+		return fmt.Errorf("RCG %#x update timeout (cmd %#x)", base+cmd, reg.Read(base+cmd))
+	}
+
+	return nil
+}
+
+// dispClkOn enables a branch clock and waits for its off status bit to
+// clear (§2).
+func dispClkOn(base, cbcr uint32) error {
+	reg.Write(base+cbcr, reg.Read(base+cbcr)|cbcrEnable)
+
+	if !pollTime(base+cbcr, cbcrOff, 0, clkPollTime) {
+		return fmt.Errorf("branch %#x stuck off (%#x)", base+cbcr, reg.Read(base+cbcr))
+	}
+
+	return nil
+}
+
+// clkOnAdvisory enables a branch whose status is unreliable under
+// dynamic gating (§2, §5.1): the enable is written and the status is
+// not waited on.
+func clkOnAdvisory(base, cbcr, set uint32) {
+	reg.Write(base+cbcr, reg.Read(base+cbcr)|set)
+}
+
+// gdscOn powers a GDSC power domain: software collapse off, then wait
+// for power on (§2).
+func gdscOn(base, gdsc uint32) error {
+	reg.Write(base+gdsc, reg.Read(base+gdsc)&^gdscCollapse)
+
+	if !pollTime(base+gdsc, gdscPwrOn, gdscPwrOn, clkPollTime) {
+		return fmt.Errorf("GDSC %#x power-on timeout (%#x)", base+gdsc, reg.Read(base+gdsc))
+	}
+
+	return nil
+}
+
+// GCC display branches and DISPCC registers (§5)
+const (
 	gccDispAHBCBCR   = 0x1700c
 	gccDispHFAXICBCR = 0x17020
 	gccDispXOCBCR    = 0x1702c
 
-	branchEnable = 0
+	// enable plus retention bits (§5.1)
+	gccDispAHBEnable = 0xb
+
+	dispccAHBCmdRCGR    = 0x2154
+	dispccNonGDSCAHB    = 0x4004
+	dispccMDSSGDSC      = 0x3000
+	dispccMDSSAHBCBCR   = 0x2044
+	dispccByteCmdRCGR   = 0x20a4
+	dispccByteIntfDiv   = 0x20bc
+	dispccPixelCmdRCGR  = 0x205c
+	dispccEscCmdRCGR    = 0x20c0
+	dispccByteCBCR      = 0x201c
+	dispccByteIntfCBCR  = 0x2020
+	dispccPixelCBCR     = 0x2004
+	dispccEscCBCR       = 0x2024
+	dispccMDPCmdRCGR    = 0x2074
+	dispccMDPCBCR       = 0x2008
+	dispccMDPLUTCBCR    = 0x2010
+	dispccVsyncCBCR     = 0x2018
+	dispccVsyncCmdRCGR  = 0x208c
+	dispccCfgXO         = 0x001 // crystal, divide by 1
+	dispccPLL0Mode      = 0x00
+	dispccPLL0L         = 0x04
+	dispccPLL0ConfigCtl = 0x10
+	dispccPLL0ConfigHi  = 0x14
+	dispccPLL0UserCtl   = 0x18
+
+	// PLL0 mode bits (§5.3)
+	pll0OutputOn     = 1 << 0
+	pll0BypassOff    = 1 << 1
+	pll0ResetRelease = 1 << 2
+	pll0Lock         = 1 << 31
 )
 
-// dispClkOn enables a simple clock branch and waits for it to run.
-func dispClkOn(base, cbcr uint32) error {
-	reg.Set(base+cbcr, branchEnable)
-
-	for i := 0; i < clkPollSpins; i++ {
-		if !reg.Get(base+cbcr, CLK_OFF) {
-			return nil
-		}
-	}
-
-	return errors.New("branch stuck off")
-}
-
-// rcgUpdate commits a CFG_RCGR configuration.
-func rcgUpdate(base, cmdRCGR, cfg uint32) error {
-	reg.Write(base+cmdRCGR+0x4, cfg)
-	reg.Set(base+cmdRCGR, CMD_UPDATE)
-
-	for i := 0; i < clkPollSpins; i++ {
-		if !reg.Get(base+cmdRCGR, CMD_UPDATE) {
-			return nil
-		}
-	}
-
-	return errors.New("RCG update timeout")
-}
-
-// EnableDisplayPower brings up everything needed to touch the DSI
-// controller and PHY registers: the GCC display-domain branches, the
-// MDSS GDSC power domain, and the dispcc AHB interface clock.
-//
-// The GCC display AHB branch reports CLK_OFF even when enabled and
-// serving a running display (dynamic root gating; observed live under
-// Linux), so the GCC-side branches are enabled without treating a
-// stuck halt bit as fatal.
+// EnableDisplayPower clocks the display register interface and powers
+// the MDSS domain (§5.1). It must precede any MDSS, DPU, DSI or DSI PHY
+// register access: an access to the unclocked blocks hangs the bus.
 func EnableDisplayPower() error {
-	// GCC side: AHB access (with retention bits, as Linux leaves it),
-	// AXI, and XO to the display subsystem
-	reg.SetN(GCC_BASE+gccDispAHBCBCR, 0, 0xf, 0xb)
-	dispClkOn(GCC_BASE, gccDispHFAXICBCR)
-	dispClkOn(GCC_BASE, gccDispXOCBCR)
+	// these three may report "off" while running: not waited on
+	clkOnAdvisory(GCC_BASE, gccDispAHBCBCR, gccDispAHBEnable)
+	clkOnAdvisory(GCC_BASE, gccDispHFAXICBCR, cbcrEnable)
+	clkOnAdvisory(GCC_BASE, gccDispXOCBCR, cbcrEnable)
 
-	// dispcc AHB clock source: XO/1 (runs the register interface)
-	if err := rcgUpdate(DISPCC_BASE, dispccAHBCmdRCGR, cfgSrcXODiv1); err != nil {
-		return errors.New("dispcc ahb rcg: " + err.Error())
+	if err := rcgUpdate(DISPCC_BASE, dispccAHBCmdRCGR, dispccCfgXO); err != nil {
+		return fmt.Errorf("dispcc ahb: %v", err)
 	}
 
-	if err := dispClkOn(DISPCC_BASE, dispccNonGDSCAHBCBCR); err != nil {
-		return errors.New("dispcc non-gdsc ahb: " + err.Error())
+	if err := dispClkOn(DISPCC_BASE, dispccNonGDSCAHB); err != nil {
+		return fmt.Errorf("dispcc non-gdsc ahb: %v", err)
 	}
 
-	// MDSS GDSC: clear the software collapse bit, wait for power-on
-	reg.Clear(DISPCC_BASE+dispccGDSCR, gdscSWCollapse)
-
-	for i := 0; ; i++ {
-		if reg.Get(DISPCC_BASE+dispccGDSCR, gdscPowerOn) {
-			break
-		}
-
-		if i >= clkPollSpins {
-			return errors.New("MDSS GDSC stuck off")
-		}
+	if err := gdscOn(DISPCC_BASE, dispccMDSSGDSC); err != nil {
+		return fmt.Errorf("mdss gdsc: %v", err)
 	}
 
-	return dispClkOn(DISPCC_BASE, dispccAHBCBCR)
+	if err := dispClkOn(DISPCC_BASE, dispccMDSSAHBCBCR); err != nil {
+		return fmt.Errorf("mdss ahb: %v", err)
+	}
+
+	return nil
 }
 
-// EnableDSIClocks routes the DSI PHY PLL outputs into the display
-// clock tree: byte0 and pclk0 from the PLL (which must be locked), and
-// the escape clock from XO. Call after the PLL reports lock.
-func EnableDSIClocks(m *DisplayMode) error {
-	if err := rcgUpdate(DISPCC_BASE, dispccByte0CmdRCGR, cfgSrcDSI0PLL); err != nil {
-		return errors.New("byte0 rcg: " + err.Error())
+// EnableDPUClock starts DISPCC PLL0 (768 MHz) and runs the MDP core
+// root from it with the mode's configuration (§5.3).
+func EnableDPUClock(m *DisplayMode) error {
+	pll := uint32(DISPCC_BASE)
+
+	if reg.Read(pll+dispccPLL0Mode)&pll0Lock == 0 {
+		reg.Write(pll+dispccPLL0L, 0x28)
+		reg.Write(pll+dispccPLL0ConfigCtl, 0x00200001)
+		reg.Write(pll+dispccPLL0ConfigHi, 0x00000004)
+		reg.Write(pll+dispccPLL0UserCtl, 0x4001055b)
+
+		mode := reg.Read(pll + dispccPLL0Mode)
+		mode |= pll0BypassOff
+		reg.Write(pll+dispccPLL0Mode, mode)
+		time.Sleep(10 * time.Microsecond)
+
+		mode |= pll0ResetRelease
+		reg.Write(pll+dispccPLL0Mode, mode)
+		time.Sleep(50 * time.Microsecond)
+
+		if !pollTime(pll+dispccPLL0Mode, pll0Lock, pll0Lock, clkPollTime) {
+			return fmt.Errorf("dispcc PLL0 lock timeout (mode %#x)", reg.Read(pll+dispccPLL0Mode))
+		}
 	}
 
-	// byte0_intf divider, as the live system runs the mode (/2 at
-	// 1080p, /1 for the 800x480 panel)
-	reg.Write(DISPCC_BASE+dispccByte0Div, m.byte0IntfDiv)
+	reg.Write(pll+dispccPLL0Mode, reg.Read(pll+dispccPLL0Mode)|pll0OutputOn)
 
-	if err := rcgUpdate(DISPCC_BASE, dispccPclk0CmdRCGR, cfgSrcDSI0PLL); err != nil {
-		return errors.New("pclk0 rcg: " + err.Error())
+	if err := rcgUpdate(DISPCC_BASE, dispccMDPCmdRCGR, m.MDPCfg); err != nil {
+		return fmt.Errorf("mdp root: %v", err)
 	}
 
-	if err := rcgUpdate(DISPCC_BASE, dispccEsc0CmdRCGR, cfgSrcXODiv1); err != nil {
-		return errors.New("esc0 rcg: " + err.Error())
+	for _, b := range []uint32{dispccMDPCBCR, dispccMDPLUTCBCR, dispccVsyncCBCR} {
+		if err := dispClkOn(DISPCC_BASE, b); err != nil {
+			return err
+		}
 	}
 
-	for _, c := range []struct {
+	if err := rcgUpdate(DISPCC_BASE, dispccVsyncCmdRCGR, dispccCfgXO); err != nil {
+		return fmt.Errorf("vsync root: %v", err)
+	}
+
+	return nil
+}
+
+// EnableDSILinkClocks runs the DSI byte, byte interface, pixel and
+// escape clocks from the DSI PHY PLL outputs (§5.2). The PLL must have
+// locked (InitDSIPHY): an RCG cannot switch to a stopped source.
+func EnableDSILinkClocks(m *DisplayMode) error {
+	if err := rcgUpdate(DISPCC_BASE, dispccByteCmdRCGR, m.ByteCfg); err != nil {
+		return fmt.Errorf("byte root: %v", err)
+	}
+
+	reg.Write(DISPCC_BASE+dispccByteIntfDiv, m.ByteIntfDiv)
+
+	if err := rcgUpdate(DISPCC_BASE, dispccPixelCmdRCGR, m.PixelCfg); err != nil {
+		return fmt.Errorf("pixel root: %v", err)
+	}
+
+	if err := rcgUpdate(DISPCC_BASE, dispccEscCmdRCGR, dispccCfgXO); err != nil {
+		return fmt.Errorf("escape root: %v", err)
+	}
+
+	branches := []struct {
 		name string
 		cbcr uint32
 	}{
-		{"byte0", dispccByte0CBCR},
-		{"byte0 intf", dispccByte0IntfCBCR},
-		{"pclk0", dispccPclk0CBCR},
-		{"esc0", dispccEsc0CBCR},
-	} {
-		if err := dispClkOn(DISPCC_BASE, c.cbcr); err != nil {
-			return errors.New(c.name + ": " + err.Error())
+		{"byte", dispccByteCBCR},
+		{"byte intf", dispccByteIntfCBCR},
+		{"pixel", dispccPixelCBCR},
+		{"escape", dispccEscCBCR},
+	}
+
+	for _, b := range branches {
+		if err := dispClkOn(DISPCC_BASE, b.cbcr); err != nil {
+			return fmt.Errorf("%s: %v", b.name, err)
 		}
 	}
 
 	return nil
+}
+
+// DisplayClockStatus returns the DISPCC branch CBCRs (MDSS AHB, MDP,
+// byte, byte interface, pixel, escape) for diagnostics (bit 31 off).
+func DisplayClockStatus() []uint32 {
+	var v []uint32
+
+	for _, cbcr := range []uint32{
+		dispccMDSSAHBCBCR, dispccMDPCBCR, dispccByteCBCR,
+		dispccByteIntfCBCR, dispccPixelCBCR, dispccEscCBCR,
+	} {
+		v = append(v, reg.Read(DISPCC_BASE+cbcr))
+	}
+
+	return v
 }

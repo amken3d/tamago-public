@@ -1,4 +1,4 @@
-// Qualcomm DSI 6G v2.4 controller driver (video mode + test pattern)
+// Qualcomm QCM2290 DSI controller: video mode, test pattern, command DMA
 // https://github.com/usbarmory/tamago
 //
 // Copyright (c) the qcm2290 package authors
@@ -9,131 +9,198 @@
 package qcm2290
 
 import (
+	"errors"
+	"fmt"
+	"time"
+
 	"github.com/usbarmory/tamago/internal/reg"
 )
 
-// DSI controller registers, physical offsets from the controller base
-// (dsi_host.c with the 6G +4 shift applied; matches techpack
-// dsi_ctrl_reg.h). Timing values replay this hardware's live 1080p60
-// snapshot: sync-pulse traffic with HSA_HE, RGB888, 4 lanes.
+// Written from bmx's docs/display-spec.md §7; see
+// docs/display-provenance.md. This controller version places every
+// register 4 bytes above the older documented layout; the offsets here
+// are physical.
+
+// DSI0_BASE is the SoC's only DSI controller (§1).
+const DSI0_BASE = 0x05e94000
+
+// DSI controller registers (§7.1)
 const (
-	DSI_CTRL_BASE = 0x05e94000
+	dsiHWVersion     = 0x000
+	dsiCtrl          = 0x004
+	dsiStatus0       = 0x008
+	dsiFIFOStatus    = 0x00c
+	dsiCmdDMACtrl    = 0x03c
+	dsiDMABase       = 0x048
+	dsiDMALen        = 0x04c
+	dsiTrigCtrl      = 0x084
+	dsiTrigDMA       = 0x090
+	dsiLaneStatus    = 0x0a8
+	dsiLaneCtrl      = 0x0ac
+	dsiTimeoutStatus = 0x0c0
+	dsiIntrCtrl      = 0x110
+	dsiReset         = 0x118
+	dsiClkCtrl       = 0x11c
+	dsiClkStatus     = 0x120
+	dsiPHYReset      = 0x12c
+	dsiTPGCtrl       = 0x15c
+	dsiTPGInitVal    = 0x164
+	dsiTPGMainCtrl   = 0x19c
+	dsiTPGVideoCfg   = 0x1a4
 
-	dsiCTRL            = 0x004
-	dsiSTATUS0         = 0x008
-	dsiVIDCFG0         = 0x010
-	dsiHSTimer         = 0x014
-	dsiVIDCFG1         = 0x020
-	dsiActiveH         = 0x024
-	dsiActiveV         = 0x028
-	dsiTotal           = 0x02c
-	dsiActiveHSync     = 0x030
-	dsiVSyncHPos       = 0x034
-	dsiVSyncVPos       = 0x038
-	dsiCmdDMACtrl      = 0x03c
-	dsiTrigCtrl        = 0x084
-	dsiLaneCtrl        = 0x0ac
-	dsiLaneSwapCtrl    = 0x0b0
-	dsiClkoutTiming    = 0x0c4
-	dsiEOTPacketCtrl   = 0x0cc
-	dsiErrIntMask0     = 0x10c
-	dsiIntrCtrl        = 0x110
-	dsiReset           = 0x118
-	dsiClkCtrl         = 0x11c
-	dsiClkStatus       = 0x120
-	dsiTPGCtrl         = 0x15c
-	dsiTPGVideoInitVal = 0x164
-	dsiTPGMainControl  = 0x19c
-	dsiTPGVideoConfig  = 0x1a4
-	dsiTimingDBMode    = 0x1e8
+	dsiCtrlEnable    = 1 << 0
+	dsiCtrlVideo     = 1 << 1
+	dsiCtrlCmd       = 1 << 2
+	dsiCtrlLane0     = 1 << 4
+	dsiCtrlClockLane = 1 << 8
 
-	dsiClkCtrlAllOn = 0x23f
+	dsiStatusCmdBusy   = 1 << 1
+	dsiStatusVideoBusy = 1 << 3
+
+	dsiDMACtrlLP = 1 << 26
+
+	dsiIntrDMADone     = 1 << 0
+	dsiIntrDMADoneMask = 1 << 1
+	dsiIntrError       = 1 << 24
+
+	dsiClkForceOn    = 0x23f
+	dsiTrigSWDMA     = 0x80001004
+	dsiLaneForceHSCk = 0x11000000
+
+	dsiCmdTimeout = 200 * time.Millisecond
 )
 
-// spinDelay busy-waits by repeated MMIO reads (~0.3 us each).
-func spinDelay(reads int) {
-	for i := 0; i < reads; i++ {
-		reg.Read(DSI_CTRL_BASE + dsiSTATUS0)
+// DSI health bits (§9.4, §11)
+const (
+	DSIStatusVideoBusy  = dsiStatusVideoBusy
+	DSIFIFOVideoUnder   = 1 << 3
+	DSIFIFOLane0HSUnder = 1 << 19
+	DSIIntrError        = dsiIntrError
+	DSITimeoutHS        = 1 << 0
+)
+
+// StartDSIVideo resets the DSI controller, programs it for the mode and
+// starts video mode (§7.2). The DSI PHY and link clocks must be running.
+// The clock lane is forced to HS last: forcing it before the enable
+// starts the clock lane in a bad state.
+func StartDSIVideo(m *DisplayMode) {
+	reg.Write(DSI0_BASE+dsiClkCtrl, dsiClkForceOn)
+	reg.Write(DSI0_BASE+dsiReset, 1)
+	time.Sleep(20 * time.Millisecond)
+	reg.Write(DSI0_BASE+dsiReset, 0)
+
+	writeTable(DSI0_BASE, m.DSI)
+
+	ctrl := m.ctrlLanes() | dsiCtrlEnable
+	reg.Write(DSI0_BASE+dsiCtrl, ctrl)
+	reg.Write(DSI0_BASE+dsiCtrl, ctrl|dsiCtrlVideo)
+
+	reg.Write(DSI0_BASE+dsiLaneCtrl, dsiLaneForceHSCk)
+}
+
+// StopDSI disables the controller (CTRL = 0) and releases the clock
+// lane force.
+func StopDSI() {
+	reg.Write(DSI0_BASE+dsiLaneCtrl, 0)
+	reg.Write(DSI0_BASE+dsiCtrl, 0)
+}
+
+// DSITestPattern turns the controller's own checkered test pattern on
+// or off (§7.2); it replaces the DPU as the pixel source.
+func DSITestPattern(on bool) {
+	if !on {
+		reg.Write(DSI0_BASE+dsiTPGCtrl, 0)
+		return
 	}
+
+	reg.Write(DSI0_BASE+dsiTPGInitVal, 0xff)
+	reg.Write(DSI0_BASE+dsiTPGMainCtrl, 0x100)
+	reg.Write(DSI0_BASE+dsiTPGVideoCfg, 0x5)
+	reg.Write(DSI0_BASE+dsiTPGCtrl, 0x30)
+	reg.Write(DSI0_BASE+dsiTPGCtrl, 0x31)
 }
 
-// dsiCtrlSnap replays every programmed controller register from the
-// live 1080p60 snapshot (RO and order-critical registers excluded:
-// version, status, CTRL, reset, clock status). Notably it includes
-// the sync-pulse HSYNC/VSYNC counts (0x40/0x44) and per-lane timing
-// groups (0x7c/0x80) that the mainline programming recipe omits.
-var dsiCtrlSnap = []regVal{
-	{0x00c, 0x00001010}, {0x010, 0x10009030}, {0x014, 0x31211101}, {0x018, 0x3e2e1e0e},
-	{0x01c, 0x00001900}, {0x024, 0x084000c0}, {0x028, 0x04610029}, {0x02c, 0x04640897},
-	{0x030, 0x002c0000}, {0x038, 0x00050000}, {0x03c, 0x14000000}, {0x040, 0x06100006},
-	{0x044, 0x00003c2c}, {0x054, 0x00000900}, {0x07c, 0x22211211}, {0x080, 0x001c1a02},
-	{0x084, 0x80001004}, {0x0a8, 0x00001f00}, {0x0b4, 0x00088888},
-	{0x0b8, 0xffffffff}, {0x0bc, 0x0000ffff}, {0x0c0, 0x00000001}, {0x0c4, 0x00000d30},
-	{0x0c8, 0x010f0f08}, {0x0cc, 0x00000001}, {0x10c, 0x13ff3be0}, {0x110, 0xaa21aa02},
-	{0x11c, 0x0000023f}, {0x134, 0xffffffff}, {0x138, 0xffffffff}, {0x13c, 0xffffffff},
-	{0x140, 0xffffffff}, {0x148, 0x0000ffff}, {0x14c, 0x0000ffff}, {0x150, 0x0000ffff},
-	{0x154, 0x0000ffff}, {0x15c, 0x00000004}, {0x1a4, 0x00000001}, {0x1a8, 0x00ff0000},
-	{0x1ac, 0x00400040}, {0x1b0, 0x000000ff}, {0x1b4, 0x00000024}, {0x1b8, 0x00000006},
-	{0x1c8, 0xffffffff}, {0x1d0, 0x00290000}, {0x1f4, 0x03000104}, {0x200, 0x80000000},
-	{0x2a0, 0x00000b00}, {0x2a8, 0x39003900}, {0x2b8, 0x3e2e0600}, {0x2bc, 0x0000f000},
-	{0x2c8, 0x00000004}, {0x300, 0x0000ffff}, {0x310, 0x00008421}, {0x314, 0x0013ffff},
-	{0x318, 0x0002a300}, {0x31c, 0x00000141}, {0x320, 0x10ffffff}, {0x324, 0x0000b81f},
-	{0x32c, 0x0000000d}, {0x330, 0x33533000}, {0x334, 0xffffffff}, {0x338, 0xffffffff},
-	{0x33c, 0xffffffff},
+// SendDSICommand transmits the command packets in a memory buffer by
+// DMA (§7.3), in LP (escape mode) or HS. The buffer address is fetched
+// through the SMMU (SMMUMapMDSSIdentity first) and its length must be a
+// multiple of 4.
+func SendDSICommand(addr uint32, length int, lp bool) error {
+	if length <= 0 || length%4 != 0 {
+		return errors.New("command buffer length must be a positive multiple of 4")
+	}
+
+	ctrl := reg.Read(DSI0_BASE + dsiCtrl)
+	defer reg.Write(DSI0_BASE+dsiCtrl, ctrl)
+
+	reg.Write(DSI0_BASE+dsiCtrl, ctrl|dsiCtrlEnable|dsiCtrlCmd)
+
+	dma := reg.Read(DSI0_BASE + dsiCmdDMACtrl)
+
+	if lp {
+		dma |= dsiDMACtrlLP
+	} else {
+		dma &^= dsiDMACtrlLP
+	}
+
+	reg.Write(DSI0_BASE+dsiCmdDMACtrl, dma)
+	reg.Write(DSI0_BASE+dsiTrigCtrl, dsiTrigSWDMA)
+
+	// clear and unmask command DMA done
+	reg.Write(DSI0_BASE+dsiIntrCtrl, reg.Read(DSI0_BASE+dsiIntrCtrl)|dsiIntrDMADone|dsiIntrDMADoneMask)
+
+	reg.Write(DSI0_BASE+dsiDMABase, addr)
+	reg.Write(DSI0_BASE+dsiDMALen, uint32(length))
+	reg.Write(DSI0_BASE+dsiTrigDMA, 1)
+
+	if !pollTime(DSI0_BASE+dsiIntrCtrl, dsiIntrDMADone, dsiIntrDMADone, dsiCmdTimeout) {
+		return fmt.Errorf("command DMA timeout (status %#x intr %#x)",
+			reg.Read(DSI0_BASE+dsiStatus0), reg.Read(DSI0_BASE+dsiIntrCtrl))
+	}
+
+	reg.Write(DSI0_BASE+dsiIntrCtrl, reg.Read(DSI0_BASE+dsiIntrCtrl)|dsiIntrDMADone)
+
+	return nil
 }
 
-// InitDSIVideo programs the DSI controller for the mode's RGB888 video
-// timing and lane count and starts the video engine. Display power, the
-// DSI PHY/PLL, and the dispcc byte/pixel clocks must already be running.
-func InitDSIVideo(m *DisplayMode) {
-	b := uint32(DSI_CTRL_BASE)
-
-	// soft reset with interface clocks forced on, then replay the
-	// full live configuration and enable
-	reg.Write(b+dsiClkCtrl, dsiClkCtrlAllOn)
-	reg.Write(b+dsiReset, 1)
-	spinDelay(60000) // ~20 ms
-	reg.Write(b+dsiReset, 0)
-
-	replay(b, m.dsiCtrl)
-
-	// clock lane + data lanes, enable, then video mode
-	ctrl := 0x100 | m.dsiLaneMask() | 1
-	reg.Write(b+dsiCTRL, ctrl)
-	reg.Write(b+dsiCTRL, ctrl|2)
-
-	// clock-lane HS force LAST (Linux dsi_op_mode_config order):
-	// forcing it before the controller enable starts the clock lane
-	// dirty and bit-slips every packet (live checksum errors on the
-	// bridge until this ordering was found)
-	reg.Write(b+dsiLaneCtrl, 0x11000000)
+// DSIStatus returns STATUS0 (bit 3 video engine busy), INTR_CTRL (bit
+// 24 error) and FIFO_STATUS (bits 3 and 19 underflow).
+func DSIStatus() (status0, intr, fifo uint32) {
+	return reg.Read(DSI0_BASE + dsiStatus0), reg.Read(DSI0_BASE + dsiIntrCtrl), reg.Read(DSI0_BASE + dsiFIFOStatus)
 }
 
-// EnableTPG turns on the controller's video test pattern generator
-// (no DPU needed): the checkered-rectangle pattern free-runs at the
-// video timing.
-func EnableTPG() {
-	b := uint32(DSI_CTRL_BASE)
-
-	reg.Write(b+dsiTPGVideoInitVal, 0xff)
-	reg.Write(b+dsiTPGMainControl, 0x100) // checkered rectangles
-	reg.Write(b+dsiTPGVideoConfig, 0x5)   // 24bpp RGB
-	reg.Write(b+dsiTPGCtrl, 0x30)         // pattern sel 3 (general)
-	reg.Write(b+dsiTPGCtrl, 0x31)         // + enable
+// DSIHealth is a DSI controller snapshot for diagnostics (§9.4, §11).
+type DSIHealth struct {
+	Version, Ctrl       uint32
+	Status0, FIFO, Intr uint32
+	Timeout             uint32
+	ClkStatus           uint32
+	// LaneStatus is instantaneous: sampled several times
+	LaneStatus [4]uint32
 }
 
-// DisableTPG stops the test pattern generator: pixel data then comes
-// from the MDP interface (DPU).
-func DisableTPG() {
-	reg.Write(DSI_CTRL_BASE+dsiTPGCtrl, 0)
-}
+// DSIHealthStatus samples the controller's state without clearing
+// anything.
+func DSIHealthStatus() (h DSIHealth) {
+	h.Version = reg.Read(DSI0_BASE + dsiHWVersion)
+	h.Ctrl = reg.Read(DSI0_BASE + dsiCtrl)
+	h.Status0, h.Intr, h.FIFO = DSIStatus()
+	h.Timeout = reg.Read(DSI0_BASE + dsiTimeoutStatus)
+	h.ClkStatus = reg.Read(DSI0_BASE + dsiClkStatus)
 
-// DSIStatus returns engine status, interrupt status, and clock status
-// for diagnostics.
-func DSIStatus() (status0, intr, clkStatus uint32) {
-	status0 = reg.Read(DSI_CTRL_BASE + dsiSTATUS0)
-	intr = reg.Read(DSI_CTRL_BASE + dsiIntrCtrl)
-	clkStatus = reg.Read(DSI_CTRL_BASE + dsiClkStatus)
+	for i := range h.LaneStatus {
+		h.LaneStatus[i] = reg.Read(DSI0_BASE + dsiLaneStatus)
+		time.Sleep(time.Duration(3+4*i) * time.Millisecond)
+	}
 
 	return
+}
+
+// ClearDSIStatus clears the latched FIFO, timeout and interrupt status
+// (write 1 to clear; INTR_CTRL's mask bits are written back unchanged),
+// so that a later DSIHealthStatus shows only new events (the error bit
+// was seen latched, not recurring, after a switch back from USB-C).
+func ClearDSIStatus() {
+	reg.Write(DSI0_BASE+dsiFIFOStatus, reg.Read(DSI0_BASE+dsiFIFOStatus))
+	reg.Write(DSI0_BASE+dsiTimeoutStatus, reg.Read(DSI0_BASE+dsiTimeoutStatus))
+	reg.Write(DSI0_BASE+dsiIntrCtrl, reg.Read(DSI0_BASE+dsiIntrCtrl))
 }

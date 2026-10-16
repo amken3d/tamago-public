@@ -1,4 +1,4 @@
-// Qualcomm Camera Control Interface (CCI) I2C master driver (polled)
+// Qualcomm QCM2290 Camera Control Interface (CCI) I2C master (polled)
 // https://github.com/usbarmory/tamago
 //
 // Copyright (c) the qcm2290 package authors
@@ -11,363 +11,387 @@ package qcm2290
 import (
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/usbarmory/tamago/internal/reg"
 )
 
-// CCI registers (drivers/i2c/busses/i2c-qcom-cci.c, cci_v2_data)
+// The CCI is a two-master I2C controller of the camera subsystem: on
+// the UNO Q with the Media Carrier, master 0 reaches the carrier's
+// DISPLAY connector (panel controller, touch), its I/O expander and
+// CAMERA0, master 1 the second camera connector.
+//
+// Written from bmx's docs/display-spec.md §3; see
+// docs/display-provenance.md.
+
+// CCI_BASE is the CCI register base (§1).
+const CCI_BASE = 0x05c1b000
+
+// GCC clocks and power of the CCI (§3.1)
 const (
-	CCI_BASE = 0x05c1b000
+	gccCameraAHBCBCR  = 0x17008
+	gccCameraXOCBCR   = 0x17028
+	gccCAMSSTopGDSC   = 0x58004
+	gccCAMSSTopAHBCmd = 0x58010
+	gccCAMSSTopAHB    = 0x58028
+	gccCCICmdRCGR     = 0x56000
+	gccCCICBCR        = 0x56018
 
-	CCI_HW_VERSION     = 0x000
-	CCI_RESET_CMD      = 0x004
-	CCI_RESET_CMD_MASK = 0x0f73f3f7
-	CCI_QUEUE_START    = 0x008
-	CCI_HALT_REQ       = 0x034
+	cciCfgXO = 0x001 // crystal, divide by 1
 
-	CCI_IRQ_GLOBAL_CLEAR_CMD = 0xc00
-	CCI_IRQ_MASK_0           = 0xc04
-	CCI_IRQ_CLEAR_0          = 0xc08
-	CCI_IRQ_STATUS_0         = 0xc0c
-
-	// CCI_IRQ_STATUS_0 / CCI_IRQ_MASK_0, master 0 (master 1 is the
-	// same layout shifted by 12, see cciMasterIRQ)
-	CCI_M0_RD_DONE   = 1 << 0
-	CCI_M0_Q0_REPORT = 1 << 4
-	CCI_M0_Q1_REPORT = 1 << 8
-	CCI_RST_DONE_ACK = 1 << 24
-	CCI_M0_HALT_ACK  = 1 << 25
-	CCI_M1_HALT_ACK  = 1 << 26
-	CCI_M0_Q0_NACK   = 1 << 27
-	CCI_M0_Q1_NACK   = 1 << 28
-	CCI_M1_Q0_NACK   = 1 << 29
-	CCI_M1_Q1_NACK   = 1 << 30
-	CCI_M0_ERROR     = 0x18000ee6
-	CCI_M1_ERROR     = 0x60ee6000
-
-	// queue command words
-	CCI_I2C_SET_PARAM     = 1
-	CCI_I2C_REPORT        = 8
-	CCI_I2C_WRITE         = 9
-	CCI_I2C_READ          = 10
-	CCI_I2C_REPORT_IRQ_EN = 1 << 8
-
-	// transfer limits (cci_v2_data quirks)
-	CCIMaxWrite = 11
-	CCIMaxRead  = 12
-
-	cciQueueWrite = 0
-	cciQueueRead  = 1
-
-	// cciPollSpins bounds status polling, sized like i2cPollSpins: a
-	// 12-byte read at the ~50 kHz XO-derived SCL is ~2.5 ms
-	cciPollSpins = 400000
+	// TLMM function of the CCI pins
+	cciPinFunction = 1
 )
 
-// per-master register offsets
-func cciSCLCtl(m int) uint32       { return uint32(0x100 + 0x100*m) }
-func cciSDACtl0(m int) uint32      { return uint32(0x104 + 0x100*m) }
-func cciSDACtl1(m int) uint32      { return uint32(0x108 + 0x100*m) }
-func cciSDACtl2(m int) uint32      { return uint32(0x10c + 0x100*m) }
-func cciMiscCtl(m int) uint32      { return uint32(0x110 + 0x100*m) }
-func cciReadData(m int) uint32     { return uint32(0x118 + 0x100*m) }
-func cciReadBufLevel(m int) uint32 { return uint32(0x11c + 0x100*m) }
+// cciPins are the SDA/SCL pins of master 0 and master 1 (§3.1).
+var cciPins = [2][2]int{{22, 23}, {29, 30}}
 
-// per-master, per-queue register offsets
-func cciExecWordCnt(m, q int) uint32 { return uint32(0x300 + 0x200*m + 0x100*q) }
-func cciCurWordCnt(m, q int) uint32  { return uint32(0x304 + 0x200*m + 0x100*q) }
-func cciLoadData(m, q int) uint32    { return uint32(0x310 + 0x200*m + 0x100*q) }
-
-// GCC camera subsystem clocks and power (drivers/clk/qcom/gcc-qcm2290.c)
+// CCI registers (§3.2)
 const (
-	gccCameraAHBCBCR = 0x17008 // critical (always-on) in Linux
-	gccCameraXOCBCR  = 0x17028 // critical (always-on) in Linux
-
-	gccCAMSSTopGDSCR      = 0x58004
-	gccCAMSSTopAHBCmdRCGR = 0x58010
-	gccCAMSSTopAHBCBCR    = 0x58028
-
-	gccCAMSSCCICmdRCGR = 0x56000
-	gccCAMSSCCI0CBCR   = 0x56018
+	cciHWVersion     = 0x000
+	cciResetCmd      = 0x004
+	cciQueueStart    = 0x008
+	cciHaltReq       = 0x034
+	cciIRQGlobalClr  = 0xc00
+	cciIRQMask0      = 0xc04
+	cciIRQClear0     = 0xc08
+	cciIRQStatus0    = 0xc0c
+	cciMasterStride  = 0x100
+	cciSCLCtl        = 0x100
+	cciSDACtl0       = 0x104
+	cciSDACtl1       = 0x108
+	cciSDACtl2       = 0x10c
+	cciMiscCtl       = 0x110
+	cciReadData      = 0x118
+	cciReadBufLevel  = 0x11c
+	cciQueueBase     = 0x300
+	cciQueueMStride  = 0x200
+	cciQueueQStride  = 0x100
+	cciExecWordCnt   = 0x0
+	cciCurWordCnt    = 0x4
+	cciLoadData      = 0x10
+	cciResetAll      = 0x0f73f3f7
+	cciIRQResetDone  = 1 << 24
+	cciIRQHaltAck0   = 1 << 25
+	cciIRQErrMask0   = 0x18000ee6
+	cciIRQErrMask1   = 0x60ee6000
+	cciIRQReadDone0  = 1 << 0
+	cciIRQQ0Report0  = 1 << 4
+	cciIRQQ1Report0  = 1 << 8
+	cciMaster1Shift  = 12
+	cciReadQueue     = 1
+	cciWriteQueue    = 0
+	cciCmdSetParam   = 1
+	cciCmdReport     = 8 | 1<<8
+	cciCmdWrite      = 9
+	cciCmdRead       = 10
+	cciMaxWrite      = 11
+	cciTransferLimit = 50 * time.Millisecond
 )
 
-// CCI master pins: SDA, SCL (TLMM function 1 = cci_i2c)
-var cciPins = [2][2]int{
-	{22, 23},
-	{29, 30},
+// cciMasterReset is the RESET_CMD mask of each master alone.
+var cciMasterReset = [2]uint32{0x3f1, 0x3f001}
+
+// CCIMaxRead is the largest read one transfer returns (§3.3).
+const CCIMaxRead = 12
+
+// Standard-mode timing counters (§3.2), the same for both masters.
+var cciTiming = [5]uint32{
+	201<<16 | 174, // SCL_CTL
+	204<<16 | 231, // SDA_CTL_0
+	22<<16 | 162,  // SDA_CTL_1
+	227,           // SDA_CTL_2
+	0<<8 | 6<<4 | 3,
 }
 
-const cciPinFunc = 1
-
-// cciStandard holds the 100 kHz standard-mode timing counters of
-// cci_v2_data. They are specified against a 37.5 MHz CCI clock; this
-// driver clocks the CCI from the 19.2 MHz crystal instead (no GPLL0
-// post-divider dependency), which scales SCL to ~51 kHz with every
-// setup and hold time proportionally longer -- slower, never out of
-// spec.
-var cciStandard = struct {
-	thigh, tlow, tsuSto, tsuSta, thdDat, thdSta, tbuf uint32
-	sclStretch, trdhld, tsp                           uint32
-}{201, 174, 204, 231, 22, 162, 227, 0, 6, 3}
-
-// EnableCCIPower brings up the camera subsystem top power domain and
-// the clocks the CCI needs, and muxes the I2C pins of both masters.
-// It must precede any CCI register access: an access to the unclocked
-// block hangs the bus.
+// EnableCCIPower clocks and powers the CCI and muxes its pins (§3.1):
+// camera AHB and XO branches, the CAMSS top GDSC, the CAMSS top AHB and
+// the CCI core clock (19.2 MHz crystal). It must precede any CCI or
+// CAMSS register access.
+//
+// The camera AHB branch reads "off" (0x8000000b) while running, like the
+// GCC display branches of §5.1 (observed under bmx 2026-10-16): the two
+// camera branches are enabled without waiting on their status.
 func EnableCCIPower() error {
-	// the camera AHB/XO branches Linux keeps permanently on
-	reg.Set(GCC_BASE+gccCameraAHBCBCR, branchEnable)
-	reg.Set(GCC_BASE+gccCameraXOCBCR, branchEnable)
+	clkOnAdvisory(GCC_BASE, gccCameraAHBCBCR, cbcrEnable)
+	clkOnAdvisory(GCC_BASE, gccCameraXOCBCR, cbcrEnable)
 
-	// CAMSS top GDSC: clear the software collapse bit, wait for power
-	reg.Clear(GCC_BASE+gccCAMSSTopGDSCR, gdscSWCollapse)
-
-	for i := 0; ; i++ {
-		if reg.Get(GCC_BASE+gccCAMSSTopGDSCR, gdscPowerOn) {
-			break
-		}
-
-		if i >= clkPollSpins {
-			return errors.New("CAMSS top GDSC stuck off")
-		}
+	if err := gdscOn(GCC_BASE, gccCAMSSTopGDSC); err != nil {
+		return fmt.Errorf("camss top: %v", err)
 	}
 
-	// CAMSS top AHB (register interface) and CCI core, both XO/1
-	if err := rcgUpdate(GCC_BASE, gccCAMSSTopAHBCmdRCGR, cfgXODiv1); err != nil {
-		return errors.New("camss top ahb rcg: " + err.Error())
+	if err := rcgUpdate(GCC_BASE, gccCAMSSTopAHBCmd, cciCfgXO); err != nil {
+		return fmt.Errorf("camss top ahb: %v", err)
 	}
 
-	if err := dispClkOn(GCC_BASE, gccCAMSSTopAHBCBCR); err != nil {
-		return errors.New("camss top ahb: " + err.Error())
+	if err := dispClkOn(GCC_BASE, gccCAMSSTopAHB); err != nil {
+		return fmt.Errorf("camss top ahb: %v", err)
 	}
 
-	if err := rcgUpdate(GCC_BASE, gccCAMSSCCICmdRCGR, cfgXODiv1); err != nil {
-		return errors.New("cci rcg: " + err.Error())
+	if err := rcgUpdate(GCC_BASE, gccCCICmdRCGR, cciCfgXO); err != nil {
+		return fmt.Errorf("cci: %v", err)
 	}
 
-	if err := dispClkOn(GCC_BASE, gccCAMSSCCI0CBCR); err != nil {
-		return errors.New("cci clk: " + err.Error())
+	if err := dispClkOn(GCC_BASE, gccCCICBCR); err != nil {
+		return fmt.Errorf("cci: %v", err)
 	}
 
-	for _, pins := range cciPins {
-		for _, n := range pins {
-			gpio, err := NewGPIO(n)
+	for _, m := range cciPins {
+		for _, pin := range m {
+			g, err := NewGPIO(pin)
 
 			if err != nil {
 				return err
 			}
 
-			gpio.SetPull(PULL_NONE)
-			gpio.SelectFunction(cciPinFunc)
+			g.SelectFunction(cciPinFunction)
+			g.SetPull(PULL_NONE)
 		}
 	}
 
 	return nil
 }
 
-// CCI represents the Camera Control Interface, a two-master I2C
-// controller driven through per-master command queues.
+// CCI represents the Camera Control Interface. Every transfer holds an
+// internal lock, so concurrent callers see whole transfers.
 type CCI struct {
 	Base uint32
+
+	mu sync.Mutex
 }
 
-// Version returns the CCI hardware version register, a safe first
-// access to confirm the block is clocked and powered.
+// Version returns the hardware version (0x10020009 on this part).
 func (c *CCI) Version() uint32 {
-	return reg.Read(c.Base + CCI_HW_VERSION)
+	return reg.Read(c.Base + cciHWVersion)
 }
 
-// Status returns the raw interrupt status, for diagnostics.
+// Status returns IRQ_STATUS_0, which latches events whether or not the
+// interrupt is routed.
 func (c *CCI) Status() uint32 {
-	return reg.Read(c.Base + CCI_IRQ_STATUS_0)
+	return reg.Read(c.Base + cciIRQStatus0)
 }
 
-func (c *CCI) clear(val uint32) {
-	reg.Write(c.Base+CCI_IRQ_CLEAR_0, val)
-	reg.Write(c.Base+CCI_IRQ_GLOBAL_CLEAR_CMD, 1)
+func cciDoneMask(m, q int) uint32 {
+	if q == cciReadQueue {
+		return cciIRQReadDone0 << (cciMaster1Shift * m)
+	}
+
+	return cciIRQQ0Report0 << (cciMaster1Shift * m)
 }
 
-// poll waits for any of the mask bits in the interrupt status (which
-// latches regardless of interrupt delivery) and clears what it saw.
-func (c *CCI) poll(mask uint32) (status uint32, ok bool) {
-	for i := 0; i < cciPollSpins; i++ {
-		status = reg.Read(c.Base + CCI_IRQ_STATUS_0)
+func cciErrMask(m int) uint32 {
+	if m == 0 {
+		return cciIRQErrMask0
+	}
 
-		if status&mask != 0 {
-			c.clear(status)
-			return status, true
+	return cciIRQErrMask1
+}
+
+func (c *CCI) clear(v uint32) {
+	reg.Write(c.Base+cciIRQClear0, v)
+	reg.Write(c.Base+cciIRQGlobalClr, 1)
+}
+
+// waitIRQ polls IRQ_STATUS_0 for any of mask, clears what was seen and
+// returns it.
+func (c *CCI) waitIRQ(mask uint32, timeout time.Duration) (uint32, bool) {
+	start := time.Now()
+
+	for {
+		if v := reg.Read(c.Base + cciIRQStatus0); v&mask != 0 {
+			c.clear(v)
+			return v, true
+		}
+
+		if time.Since(start) > timeout {
+			return reg.Read(c.Base + cciIRQStatus0), false
 		}
 	}
-
-	return status, false
 }
 
-// Init resets the controller and programs standard-mode timing on both
-// masters. EnableCCIPower must have been called.
-func (c *CCI) Init() error {
-	// unmask what the polls below wait on, as Linux cci_init does
-	m0, _, e0 := cciMasterIRQ(0)
-	m1, _, e1 := cciMasterIRQ(1)
-	reg.Write(c.Base+CCI_IRQ_MASK_0, m0|m1|e0|e1|CCI_RST_DONE_ACK|CCI_M0_HALT_ACK|CCI_M1_HALT_ACK)
-	c.clear(0xffffffff)
+func (c *CCI) setTiming(m int) {
+	base := c.Base + uint32(m)*cciMasterStride
 
-	reg.Write(c.Base+CCI_RESET_CMD, CCI_RESET_CMD_MASK)
-
-	if _, ok := c.poll(CCI_RST_DONE_ACK); !ok {
-		return errors.New("CCI reset timeout")
+	for i, v := range cciTiming {
+		reg.Write(base+cciSCLCtl+uint32(i)*4, v)
 	}
+}
+
+// Init unmasks the completion, error, reset and halt events, resets the
+// controller and programs both masters' timing (§3.3).
+func (c *CCI) Init() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	mask := uint32(cciIRQResetDone | cciIRQHaltAck0 | cciIRQHaltAck0<<1)
 
 	for m := 0; m < 2; m++ {
-		c.timing(m)
+		mask |= cciDoneMask(m, cciReadQueue) | cciDoneMask(m, cciWriteQueue) |
+			cciIRQQ1Report0<<(cciMaster1Shift*m) | cciErrMask(m)
 	}
+
+	reg.Write(c.Base+cciIRQMask0, mask)
+	c.clear(0xffffffff)
+
+	reg.Write(c.Base+cciResetCmd, cciResetAll)
+
+	if _, ok := c.waitIRQ(cciIRQResetDone, cciTransferLimit); !ok {
+		return fmt.Errorf("CCI reset timeout (status %#x)", c.Status())
+	}
+
+	c.setTiming(0)
+	c.setTiming(1)
 
 	return nil
 }
 
-func (c *CCI) timing(m int) {
-	t := cciStandard
-
-	reg.Write(c.Base+cciSCLCtl(m), t.thigh<<16|t.tlow)
-	reg.Write(c.Base+cciSDACtl0(m), t.tsuSto<<16|t.tsuSta)
-	reg.Write(c.Base+cciSDACtl1(m), t.thdDat<<16|t.thdSta)
-	reg.Write(c.Base+cciSDACtl2(m), t.tbuf)
-	reg.Write(c.Base+cciMiscCtl(m), t.sclStretch<<8|t.trdhld<<4|t.tsp)
-}
-
-// cciMasterIRQ returns the completion and error status bits of a
-// master: master 1's RD_DONE/REPORT bits sit 12 above master 0's.
-func cciMasterIRQ(m int) (done, nack, errs uint32) {
-	done = uint32(CCI_M0_RD_DONE|CCI_M0_Q0_REPORT|CCI_M0_Q1_REPORT) << (12 * m)
-
-	if m == 0 {
-		return done, CCI_M0_Q0_NACK | CCI_M0_Q1_NACK, CCI_M0_ERROR
-	}
-
-	return done, CCI_M1_Q0_NACK | CCI_M1_Q1_NACK, CCI_M1_ERROR
-}
-
-// recover halts and resets a master after an error, as the Linux ISR
-// does (HALT_REQ -> HALT_ACK -> per-master RESET_CMD), then restores
-// its timing.
+// recover halts and resets one master after a NACK or error (§3.3).
 func (c *CCI) recover(m int) {
-	haltAck := uint32(CCI_M0_HALT_ACK)
-	resetMask := uint32(0x000003f1)
+	reg.Write(c.Base+cciHaltReq, 1<<m)
+	c.waitIRQ(cciIRQHaltAck0<<m, cciTransferLimit)
 
-	if m == 1 {
-		haltAck = CCI_M1_HALT_ACK
-		resetMask = 0x0003f001
-	}
+	reg.Write(c.Base+cciResetCmd, cciMasterReset[m])
+	c.waitIRQ(cciIRQResetDone, cciTransferLimit)
 
-	reg.Write(c.Base+CCI_HALT_REQ, 1<<m)
-	c.poll(haltAck)
-
-	reg.Write(c.Base+CCI_RESET_CMD, resetMask)
-	c.poll(CCI_RST_DONE_ACK)
-
-	c.timing(m)
+	c.setTiming(m)
 }
 
-// run executes the words loaded into a queue and waits for the report.
-func (c *CCI) run(m, q int) error {
-	reg.Write(c.Base+cciExecWordCnt(m, q), reg.Read(c.Base+cciCurWordCnt(m, q)))
-	reg.Write(c.Base+CCI_QUEUE_START, 1<<(m*2+q))
+// run loads command words into queue q of master m, executes them and
+// waits for completion.
+func (c *CCI) run(m, q int, words []uint32) error {
+	qb := c.Base + cciQueueBase + uint32(m)*cciQueueMStride + uint32(q)*cciQueueQStride
 
-	done, nack, errs := cciMasterIRQ(m)
-	status, ok := c.poll(done | errs)
+	for _, w := range words {
+		reg.Write(qb+cciLoadData, w)
+	}
+
+	reg.Write(qb+cciExecWordCnt, reg.Read(qb+cciCurWordCnt))
+	reg.Write(c.Base+cciQueueStart, 1<<(2*m+q))
+
+	errs := cciErrMask(m)
+	v, ok := c.waitIRQ(cciDoneMask(m, q)|errs, cciTransferLimit)
 
 	switch {
-	case status&nack != 0:
-		c.recover(m)
-		return errors.New("NACK")
-	case status&errs != 0:
-		c.recover(m)
-		return fmt.Errorf("bus error (status %#x)", status)
 	case !ok:
 		c.recover(m)
-		return errors.New("timeout")
+		return fmt.Errorf("timeout (status %#x)", v)
+	case v&errs&^cciDoneMask(m, q) != 0:
+		c.recover(m)
+
+		// NACK bits: master 0 queue 0/1 bits 27/28, master 1 29/30
+		if v&(3<<(27+2*m)) != 0 {
+			return errors.New("NACK")
+		}
+
+		return fmt.Errorf("bus error (status %#x)", v)
 	}
 
 	return nil
 }
 
-func (c *CCI) load(m, q int, val uint32) {
-	reg.Write(c.Base+cciLoadData(m, q), val)
+func checkMaster(m int) error {
+	if m != 0 && m != 1 {
+		return errors.New("CCI master must be 0 or 1")
+	}
+
+	return nil
 }
 
-// Write transmits buf (1-11 bytes) to a 7-bit slave address on master
-// m, ending with a stop.
-func (c *CCI) Write(m int, addr uint8, buf []byte) error {
-	n := len(buf)
-
-	if n == 0 || n > CCIMaxWrite {
-		return fmt.Errorf("write length must be 1-%d bytes", CCIMaxWrite)
-	}
-
-	q := cciQueueWrite
-
-	c.load(m, q, CCI_I2C_SET_PARAM|uint32(addr&0x7f)<<4)
-
-	// the WRITE command byte and its payload are packed four bytes per
-	// queue word, little-endian
-	load := make([]byte, (n+1+3)&^3)
-	load[0] = byte(CCI_I2C_WRITE | n<<4)
-	copy(load[1:], buf)
-
-	for i := 0; i < len(load); i += 4 {
-		c.load(m, q, uint32(load[i])|uint32(load[i+1])<<8|uint32(load[i+2])<<16|uint32(load[i+3])<<24)
-	}
-
-	c.load(m, q, CCI_I2C_REPORT|CCI_I2C_REPORT_IRQ_EN)
-
-	return c.run(m, q)
-}
-
-// Read receives len(buf) (1-12) bytes from a 7-bit slave address on
-// master m, ending with a stop.
-func (c *CCI) Read(m int, addr uint8, buf []byte) error {
-	n := len(buf)
-
-	if n == 0 || n > CCIMaxRead {
-		return fmt.Errorf("read length must be 1-%d bytes", CCIMaxRead)
-	}
-
-	q := cciQueueRead
-
-	c.load(m, q, CCI_I2C_SET_PARAM|uint32(addr&0x7f)<<4)
-	c.load(m, q, CCI_I2C_READ|uint32(n)<<4)
-
-	if err := c.run(m, q); err != nil {
+// Write transmits 1-11 bytes to a 7-bit address on master m, through
+// queue 0: SET_PARAM, WRITE with the data, REPORT.
+func (c *CCI) Write(m int, addr uint8, data []byte) error {
+	if err := checkMaster(m); err != nil {
 		return err
 	}
 
-	words := reg.Read(c.Base + cciReadBufLevel(m))
+	n := len(data)
 
-	if want := uint32(n/4 + 1); words != want {
-		return fmt.Errorf("read buffer holds %d words, want %d", words, want)
+	if n < 1 || n > cciMaxWrite {
+		return fmt.Errorf("CCI write length must be 1-%d", cciMaxWrite)
 	}
 
-	// the buffer leads with one byte that is not data (the LS byte of
-	// the first word), then the bytes read, LS byte first
-	idx := -1
+	// the WRITE command byte and the data, four bytes per word, least
+	// significant byte first
+	b := append([]byte{byte(cciCmdWrite | n<<4)}, data...)
+	words := []uint32{cciCmdSetParam | uint32(addr&0x7f)<<4}
 
-	for ; words > 0; words-- {
-		val := reg.Read(c.Base + cciReadData(m))
+	for i := 0; i < len(b); i += 4 {
+		var w uint32
 
-		for i := 0; i < 4; i++ {
-			if idx >= 0 && idx < n {
-				buf[idx] = byte(val >> (8 * i))
-			}
-
-			idx++
+		for j := 0; j < 4 && i+j < len(b); j++ {
+			w |= uint32(b[i+j]) << (8 * j)
 		}
+
+		words = append(words, w)
+	}
+
+	words = append(words, cciCmdReport)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.run(m, cciWriteQueue, words)
+}
+
+// Read receives 1-12 bytes from a 7-bit address on master m, through
+// queue 1: SET_PARAM, READ. On a freshly initialised master bare reads
+// NACK until one write has completed on it (§3.3).
+func (c *CCI) Read(m int, addr uint8, buf []byte) error {
+	if err := checkMaster(m); err != nil {
+		return err
+	}
+
+	n := len(buf)
+
+	if n < 1 || n > CCIMaxRead {
+		return fmt.Errorf("CCI read length must be 1-%d", CCIMaxRead)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	words := []uint32{
+		cciCmdSetParam | uint32(addr&0x7f)<<4,
+		cciCmdRead | uint32(n)<<4,
+	}
+
+	if err := c.run(m, cciReadQueue, words); err != nil {
+		return err
+	}
+
+	mb := c.Base + uint32(m)*cciMasterStride
+	want := n/4 + 1
+
+	if lvl := int(reg.Read(mb + cciReadBufLevel)); lvl < want {
+		return fmt.Errorf("read buffer holds %d words, want %d", lvl, want)
+	}
+
+	// the first byte is not data; the n data bytes follow, least
+	// significant byte first
+	i := -1
+
+	for w := 0; w < want; w++ {
+		v := reg.Read(mb + cciReadData)
+
+		for j := 0; j < 4; j, i = j+1, i+1 {
+			if i >= 0 && i < n {
+				buf[i] = byte(v >> (8 * j))
+			}
+		}
+	}
+
+	// residue would shift the next read's data
+	for lvl := reg.Read(mb + cciReadBufLevel); lvl > 0 && lvl < 64; lvl-- {
+		reg.Read(mb + cciReadData)
 	}
 
 	return nil
 }
 
-// ReadReg performs a register read: a one-byte register-address write,
-// a stop, then an n-byte read. The CCI queue has no repeated-start
-// write-then-read, as in Linux, which issues the same two transfers.
+// ReadReg writes a one-byte register address, then reads len(buf)
+// bytes: the queue has no combined repeated-start transfer, so this is
+// two transfers with a stop between them.
 func (c *CCI) ReadReg(m int, addr, regAddr uint8, buf []byte) error {
 	if err := c.Write(m, addr, []byte{regAddr}); err != nil {
 		return err

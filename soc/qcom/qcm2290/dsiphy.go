@@ -1,4 +1,4 @@
-// Qualcomm 14nm DSI PHY and PLL driver (QCM2290)
+// Qualcomm QCM2290 DSI PHY and PLL (14 nm PHY)
 // https://github.com/usbarmory/tamago
 //
 // Copyright (c) the qcm2290 package authors
@@ -9,177 +9,103 @@
 package qcm2290
 
 import (
-	"errors"
+	"fmt"
+	"time"
 
 	"github.com/usbarmory/tamago/internal/reg"
 )
 
-// 14nm DSI PHY register blocks (drivers/gpu/drm/msm/dsi/phy/
-// dsi_phy_14nm.c). The static configuration replays, verbatim, a
-// register snapshot of this exact hardware running 1080p60 (VCO
-// 1.782 GHz, 891 Mbps/lane, byte 111.375 MHz, pixel 148.5 MHz); the
-// enable ordering, resets, and lock polling follow the driver.
+// Written from bmx's docs/display-spec.md §6; see
+// docs/display-provenance.md.
+
+// DSI PHY bases (§1)
 const (
-	DSI_PHY_CMN_BASE  = 0x05e94400
-	DSI_PHY_LANE_BASE = 0x05e94500
-	DSI_PLL_BASE      = 0x05e94800
-
-	phyGLBL_TEST_CTRL = 0x18
-	phyCTRL_0         = 0x1c
-	phyCTRL_1         = 0x20
-	phyPLL_CNTRL      = 0x48
-	phyLDO_CNTRL      = 0x4c
-
-	pllREADY_STATUS = 0x0cc
-
-	pllLockedBit = 5
-	pllReadyBit  = 0
+	DSIPHY_BASE  = 0x05e94400 // common block
+	DSILANE_BASE = 0x05e94500
+	DSIPLL_BASE  = 0x05e94800
 )
 
-type regVal struct {
-	off uint32
-	val uint32
-}
+// PHY common registers used by name, and the PLL status (§6)
+const (
+	phyClkCfg       = 0x10
+	phyGlblTestCtrl = 0x18
+	phyCtrl0        = 0x1c
+	phyCtrl1        = 0x20
+	phyPLLCntrl     = 0x48
+	phyLDOCntrl     = 0x4c
 
-// CMN static config (snapshot; 0x80.. is a mirror). PLL_CNTRL (0x48)
-// is excluded: it starts the PLL and is written last.
-var phyCMNSnap = []regVal{
-	{0x000, 0x02}, {0x010, 0x32}, {0x014, 0x01}, {0x018, 0x01},
-	{0x01c, 0xff}, {0x034, 0x01}, {0x038, 0x5a}, {0x03c, 0x10},
-	{0x040, 0x0a}, {0x04c, 0x3c}, {0x060, 0xff},
-}
+	pllStatus       = 0x0cc
+	pllStatusLocked = 1 << 5
+	pllStatusReady  = 1 << 0
 
-// full lane region snapshot: four data lanes, the clock lane, and the
-// trailing block the driver leaves configured
-var phyLaneSnap = []regVal{
-	{0x008, 0x10}, {0x00c, 0x0f}, {0x014, 0x88}, {0x018, 0x24}, {0x01c, 0x1f},
-	{0x020, 0x08}, {0x024, 0x09}, {0x028, 0x05}, {0x02c, 0x03}, {0x030, 0x04},
-	{0x034, 0xa0}, {0x038, 0xff}, {0x03c, 0x06}, {0x040, 0x10}, {0x044, 0xff},
-	{0x048, 0xff}, {0x04c, 0x1f}, {0x050, 0xb8}, {0x064, 0x1d}, {0x068, 0x88},
-	{0x07c, 0xff}, {0x088, 0x10}, {0x08c, 0x0f}, {0x094, 0x88}, {0x098, 0x24},
-	{0x09c, 0x1f}, {0x0a0, 0x08}, {0x0a4, 0x09}, {0x0a8, 0x05}, {0x0ac, 0x03},
-	{0x0b0, 0x04}, {0x0b4, 0xa0}, {0x0b8, 0xff}, {0x0bc, 0x06}, {0x0c0, 0x10},
-	{0x0c4, 0xff}, {0x0c8, 0xff}, {0x0cc, 0x1f}, {0x0d0, 0xb8}, {0x0e4, 0x1d},
-	{0x0e8, 0x88}, {0x0fc, 0xff}, {0x108, 0x10}, {0x10c, 0x0f}, {0x114, 0x88},
-	{0x118, 0x24}, {0x11c, 0x1f}, {0x120, 0x08}, {0x124, 0x09}, {0x128, 0x05},
-	{0x12c, 0x03}, {0x130, 0x04}, {0x134, 0xa0}, {0x138, 0xff}, {0x13c, 0x06},
-	{0x140, 0x10}, {0x144, 0xff}, {0x148, 0xff}, {0x14c, 0x1f}, {0x150, 0xb8},
-	{0x164, 0x1d}, {0x168, 0x88}, {0x17c, 0xff}, {0x188, 0x10}, {0x18c, 0x0f},
-	{0x194, 0x88}, {0x198, 0x24}, {0x19c, 0x1f}, {0x1a0, 0x08}, {0x1a4, 0x09},
-	{0x1a8, 0x05}, {0x1ac, 0x03}, {0x1b0, 0x04}, {0x1b4, 0xa0}, {0x1b8, 0xff},
-	{0x1bc, 0x06}, {0x1c0, 0x10}, {0x1c4, 0xff}, {0x1c8, 0xff}, {0x1cc, 0x1f},
-	{0x1d0, 0xb8}, {0x1e4, 0x1d}, {0x1e8, 0x88}, {0x1fc, 0xff}, {0x208, 0x10},
-	{0x20c, 0x8f}, {0x214, 0x88}, {0x218, 0x24}, {0x21c, 0x1b}, {0x220, 0x08},
-	{0x224, 0x09}, {0x228, 0x05}, {0x22c, 0x03}, {0x230, 0x04}, {0x234, 0xa0},
-	{0x238, 0xff}, {0x240, 0x10}, {0x244, 0xff}, {0x248, 0xff}, {0x24c, 0x1f},
-	{0x250, 0xb8}, {0x264, 0x1d}, {0x268, 0x88}, {0x27c, 0xff}, {0x298, 0x01},
-	{0x29c, 0x05}, {0x2a0, 0x01}, {0x2a4, 0x01}, {0x2a8, 0x01}, {0x2ac, 0x13},
-	{0x2b0, 0x04}, {0x2c0, 0x10}, {0x2c4, 0xff}, {0x2c8, 0xff}, {0x2cc, 0x1f},
-	{0x2d0, 0xb8}, {0x2e4, 0x1c}, {0x2fc, 0xff},
-}
+	pllLockTimeout = 100 * time.Millisecond
+)
 
-// PLL configuration snapshot (READY_STATUS 0xcc excluded: read-only)
-var phyPLLSnap = []regVal{
-	{0x000, 0x04}, {0x004, 0x04}, {0x008, 0x02}, {0x010, 0x07},
-	{0x01c, 0x01}, {0x02c, 0x30}, {0x030, 0x20}, {0x034, 0xe8},
-	{0x038, 0x03}, {0x03c, 0x05}, {0x040, 0x5f}, {0x048, 0x3c},
-	{0x050, 0x09}, {0x054, 0x02}, {0x05c, 0x10}, {0x068, 0x24},
-	{0x06c, 0x5e}, {0x074, 0x7b}, {0x078, 0x03}, {0x07c, 0x48},
-	{0x080, 0x09}, {0x088, 0x02}, {0x090, 0x5c},
-
-	// Spread-spectrum, which the original capture dropped: SSC_EN_CENTER,
-	// SSC_ADJ_PER1, SSC_PER1/2 and SSC_STEP_SIZE1/2, in both PLL banks
-	// (bank 1 is the same block at +0x200). Every other one of the 448
-	// PHY registers already matched the stock driver.
-	{0x094, 0x01}, {0x098, 0x25}, {0x0a0, 0x30},
-	{0x0a4, 0x01}, {0x0a8, 0xd2}, {0x0ac, 0xec},
-	{0x294, 0x01}, {0x298, 0x25}, {0x2a0, 0x30},
-	{0x2a4, 0x01}, {0x2a8, 0xd2}, {0x2ac, 0xec},
-
-	{0x0bc, 0x0d}, {0x0c0, 0x01}, {0x0c4, 0x12},
-	{0x0d0, 0x1c}, {0x0d4, 0x10}, {0x0e8, 0x10}, {0x0f0, 0x09},
-	{0x0fc, 0x24}, {0x100, 0x1b}, {0x104, 0x03}, {0x10c, 0x10},
-}
-
-func replay(base uint32, snap []regVal) {
-	for _, r := range snap {
-		reg.Write(base+r.off, r.val)
+// writeTable writes a register table at a block base, in order.
+func writeTable(base uint32, t []RegVal) {
+	for _, r := range t {
+		reg.Write(base+r.Off, r.Val)
 	}
 }
 
-func udelaySpin(n int) {
-	for i := 0; i < n*4; i++ {
-		reg.Read(DSI_PHY_CMN_BASE + phyGLBL_TEST_CTRL)
-	}
-}
+// InitDSIPHY powers the DSI PHY, programs its lanes and PLL for the
+// mode and starts the PLL, waiting for lock and ready (§6). The DSI
+// link clocks can be enabled once it returns (EnableDSILinkClocks).
+// EnableDisplayPower must have been called.
+func InitDSIPHY(m *DisplayMode) error {
+	// 1. controller PHY-interface reset
+	reg.Write(DSI0_BASE+dsiPHYReset, 0x01000001)
+	time.Sleep(100 * time.Microsecond)
+	reg.Write(DSI0_BASE+dsiPHYReset, 0)
 
-// EnableDSIPHY powers up the 14nm DSI PHY lanes and locks the PLL for
-// the display mode (1080p60: 1.782 GHz, 891 Mbps/lane). The display
-// power domain and AHB clocks must already be up (EnableDisplayPower).
-func EnableDSIPHY(m *DisplayMode) error {
-	cmn := uint32(DSI_PHY_CMN_BASE)
+	// 2. LDO and global test control
+	reg.Write(DSIPHY_BASE+phyLDOCntrl, 0x1c)
+	reg.Write(DSIPHY_BASE+phyGlblTestCtrl, 0x01)
 
-	// controller-side PHY interface reset first (msm host reset_phy)
-	reg.Write(DSI_CTRL_BASE+0x12c, 0x1000001)
-	udelaySpin(100)
-	reg.Write(DSI_CTRL_BASE+0x12c, 0)
+	// 3. lanes
+	writeTable(DSILANE_BASE, m.PHYLanes)
 
-	// early enables, then the full lane configuration
-	reg.Write(cmn+phyLDO_CNTRL, 0x1c)
-	reg.Write(cmn+phyGLBL_TEST_CTRL, 0x01)
-	replay(DSI_PHY_LANE_BASE, m.phyLane)
+	// 4. digital reset with the PLL stopped
+	reg.Write(DSIPHY_BASE+phyPLLCntrl, 0)
+	reg.Write(DSIPHY_BASE+phyCtrl1, 0x80)
+	time.Sleep(100 * time.Microsecond)
+	reg.Write(DSIPHY_BASE+phyCtrl1, 0)
 
-	// digital block reset with the PLL stopped
-	reg.Write(cmn+phyPLL_CNTRL, 0x00)
-	reg.Write(cmn+phyCTRL_1, 0x80)
-	udelaySpin(100)
-	reg.Write(cmn+phyCTRL_1, 0x00)
+	// 5. PLL and all lanes powered
+	reg.Write(DSIPHY_BASE+phyCtrl0, 0xff)
 
-	reg.Write(cmn+phyCTRL_0, 0xff) // power up PLL + all lanes
+	// 6. PLL frequency, spread spectrum, trims
+	writeTable(DSIPLL_BASE, m.PLL)
 
-	// PLL configuration (includes frequency, SSC, trims; snapshot)
-	replay(DSI_PLL_BASE, m.phyPLL)
+	// 7. PLL software reset
+	reg.Write(DSIPHY_BASE+phyPLLCntrl, 0)
+	reg.Write(DSIPHY_BASE+phyCtrl1, 0x20)
+	time.Sleep(10 * time.Microsecond)
+	reg.Write(DSIPHY_BASE+phyCtrl1, 0)
 
-	// PLL software reset
-	reg.Write(cmn+phyPLL_CNTRL, 0x00)
-	reg.Write(cmn+phyCTRL_1, 0x20)
-	udelaySpin(10)
-	reg.Write(cmn+phyCTRL_1, 0x00)
-
-	// CMN static config (clock dividers, LDO, misc)
-	replay(DSI_PHY_CMN_BASE, m.phyCMN)
-
-	// start + lock
-	reg.Write(cmn+phyPLL_CNTRL, 0x01)
-
-	if !pollPLLBit(pllLockedBit) {
-		return errors.New("DSI PLL lock timeout")
+	// 8. common registers, never PLL_CNTRL from a table
+	for _, r := range m.PHYCommon {
+		if r.Off != phyPLLCntrl {
+			reg.Write(DSIPHY_BASE+r.Off, r.Val)
+		}
 	}
 
-	if !pollPLLBit(pllReadyBit) {
-		return errors.New("DSI PLL ready timeout")
+	// 9. start the PLL
+	reg.Write(DSIPHY_BASE+phyPLLCntrl, 1)
+
+	if !pollTime(DSIPLL_BASE+pllStatus, pllStatusLocked, pllStatusLocked, pllLockTimeout) {
+		return fmt.Errorf("DSI PLL lock timeout (status %#x)", reg.Read(DSIPLL_BASE+pllStatus))
+	}
+
+	if !pollTime(DSIPLL_BASE+pllStatus, pllStatusReady, pllStatusReady, pllLockTimeout) {
+		return fmt.Errorf("DSI PLL ready timeout (status %#x)", reg.Read(DSIPLL_BASE+pllStatus))
 	}
 
 	return nil
 }
 
-func pollPLLBit(bit int) bool {
-	for i := 0; i < 100; i++ {
-		if reg.Get(DSI_PLL_BASE+pllREADY_STATUS, bit) {
-			return true
-		}
-
-		udelaySpin(1000)
-	}
-
-	return false
-}
-
-// DSIPHYStatus returns PLL diagnostic registers.
-func DSIPHYStatus() (ready, clkCfg0, pllCntrl uint32) {
-	ready = reg.Read(DSI_PLL_BASE + pllREADY_STATUS)
-	clkCfg0 = reg.Read(DSI_PHY_CMN_BASE + 0x10)
-	pllCntrl = reg.Read(DSI_PHY_CMN_BASE + phyPLL_CNTRL)
-
-	return
+// DSIPLLStatus returns the PLL status register (bit 5 locked, bit 0
+// ready) and the PHY clock configuration.
+func DSIPLLStatus() (status, clkCfg uint32) {
+	return reg.Read(DSIPLL_BASE + pllStatus), reg.Read(DSIPHY_BASE + phyClkCfg)
 }
