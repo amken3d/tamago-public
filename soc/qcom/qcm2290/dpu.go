@@ -10,7 +10,6 @@ package qcm2290
 
 import (
 	"errors"
-	"time"
 
 	"github.com/usbarmory/tamago/internal/reg"
 )
@@ -21,7 +20,8 @@ import (
 // INTF1 (DSI); only the source addresses are repointed at the caller's
 // framebuffer.
 const (
-	DPU_BASE = 0x05e01000
+	DPU_BASE  = 0x05e01000
+	VBIF_BASE = 0x05eb0000
 
 	dpuTop   = 0x0
 	dpuCTL0  = 0x1000
@@ -38,6 +38,7 @@ const (
 	// CTL_FLUSH block bits (dpu_hw_ctl.c)
 	ctlFlushVIG0 = 1 << 0
 	ctlFlushLM0  = 1 << 6
+	ctlFlushCTL  = 1 << 17
 	ctlFlushINTF = 1 << 31
 
 	// VIG0 source address registers (repointed)
@@ -94,6 +95,28 @@ const (
 	mdssCB = 8
 )
 
+// dpuVBIFQoS is the VBIF read QoS configuration of the live Linux
+// display (the DPU's memory bus arbiter, at VBIF_BASE): the client
+// priority levels and the per-level QoS remap tables, which raise the
+// real-time scanout clients' priority. Left at reset values, the VIG0
+// fetch loses arbitration: the DSI video FIFO underflows (FIFO_STATUS
+// VIDEO_MDP_FIFO_UNDERFLOW and lane 0 HS underflow) and a panel falls
+// back to its own self test. Mode independent.
+var dpuVBIFQoS = []regVal{
+	{0x160, 0x33333333}, {0x164, 0x00333333}, {0x550, 0x00000003},
+	{0x554, 0x00000000}, {0x558, 0x11111113}, {0x55c, 0x00111111},
+	{0x560, 0x22222224}, {0x564, 0x00222222}, {0x568, 0x33333334},
+	{0x56c, 0x00333333}, {0x570, 0x44444445}, {0x574, 0x00444444},
+	{0x578, 0x55555555}, {0x57c, 0x00555555}, {0x580, 0x66666666},
+	{0x584, 0x00666666}, {0x588, 0x77777776}, {0x58c, 0x00777777},
+	{0x590, 0x00000003}, {0x594, 0x00000000}, {0x598, 0x11111113},
+	{0x59c, 0x00111111}, {0x5a0, 0x22222224}, {0x5a4, 0x00222222},
+	{0x5a8, 0x33333334}, {0x5ac, 0x00333333}, {0x5b0, 0x44444445},
+	{0x5b4, 0x00444444}, {0x5b8, 0x55555555}, {0x5bc, 0x00555555},
+	{0x5c0, 0x66666666}, {0x5c4, 0x00666666}, {0x5c8, 0x77777776},
+	{0x5cc, 0x00777777},
+}
+
 var dpuTopSnap = []regVal{
 	{0x00c, 0x00000200}, {0x014, 0x08000100}, {0x19c, 0x00000455},
 	{0x1e8, 0x00000038}, {0x1ec, 0x00000001}, {0x2ac, 0x40000444},
@@ -138,11 +161,15 @@ var dpuPP0Snap = []regVal{
 	{0x0ac, 0x0002c688}, {0x0c8, 0x0002c688},
 }
 
+// INTF_PANEL_FORMAT (0x090) is 0x213f -- RGB888 with 8 bits per
+// component -- although a snapshot reads back 0x2100: the bit depth
+// fields are write-only. Replayed as read, the INTF has no pixel
+// format and underruns, showing INTF_UNDERFLOW_COLOR (blue).
 var dpuINTF1Snap = []regVal{
 	{0x004, 0x00800000}, {0x008, 0x0898002c}, {0x00c, 0x0025c3f8},
 	{0x014, 0x00002af8}, {0x01c, 0x00016058}, {0x024, 0x0025a197},
 	{0x03c, 0x083f00c0}, {0x048, 0x000000ff}, {0x060, 0x00000010},
-	{0x064, 0x083f00c0}, {0x08c, 0x00000011}, {0x090, 0x00002100},
+	{0x064, 0x083f00c0}, {0x08c, 0x00000011}, {0x090, 0x0000213f},
 	{0x094, 0x76543210}, {0x0ac, 0x0000554a}, {0x0b0, 0x0000033b},
 	{0x0b8, 0x00000010}, {0x178, 0xffffffff}, {0x180, 0x01000000},
 	{0x1c4, 0x00000a00}, {0x1d8, 0x00000002}, {0x1dc, 0x00020001},
@@ -195,11 +222,49 @@ func SMMUFaults() (gfsr, cbfsr uint32) {
 	return
 }
 
+// dpuTraceWrites are configuration writes the Linux driver makes that
+// a register snapshot cannot capture: zeros over non-zero reset values
+// (CTL_TOP resets to 0x1f00 and must be 0 in video mode, or CTL0 never
+// routes to the INTF) and registers whose value does not read back.
+// Taken from a trace of every DPU write during a live Linux bring-up
+// of the 800x480 panel; mode independent.
+var dpuTraceWrites = []struct {
+	block uint32
+	regVal
+}{
+	{dpuTop, regVal{0x028, 0}}, // SSPP_SPARE
+	{dpuTop, regVal{0x2f4, 0}}, // SPLIT_DISPLAY_EN
+	{dpuTop, regVal{0x2f8, 0}}, // SPLIT_DISPLAY_UPPER_PIPE_CTRL
+	{dpuTop, regVal{0x3f0, 0}}, // SPLIT_DISPLAY_LOWER_PIPE_CTRL
+
+	{dpuCTL0, regVal{0x014, 0}}, // CTL_TOP: video mode, no INTF select
+	{dpuCTL0, regVal{0x040, 0}}, // CTL_LAYER_EXT(LM0)
+	{dpuCTL0, regVal{0x070, 0}}, // CTL_LAYER_EXT2(LM0)
+	{dpuCTL0, regVal{0x0a0, 0}}, // CTL_LAYER_EXT3(LM0)
+	{dpuCTL0, regVal{0x0e4, 0}}, // CTL_MERGE_3D_ACTIVE
+	{dpuCTL0, regVal{0x0e8, 0}}, // CTL_DSC_ACTIVE
+	{dpuCTL0, regVal{0x0ec, 0}}, // CTL_WB_ACTIVE
+	{dpuCTL0, regVal{0x0f0, 0}}, // CTL_CWB_ACTIVE
+	{dpuCTL0, regVal{0x0fc, 0}}, // CTL_FETCH_PIPE_ACTIVE
+
+	{dpuINTF1, regVal{0x02c, 0}}, // INTF_ACTIVE_V_START_F0
+	{dpuINTF1, regVal{0x034, 0}}, // INTF_ACTIVE_V_END_F0
+	{dpuINTF1, regVal{0x040, 0}}, // INTF_ACTIVE_HCTL
+	{dpuINTF1, regVal{0x044, 0}}, // INTF_BORDER_COLOR
+	{dpuINTF1, regVal{0x04c, 0}}, // INTF_HSYNC_SKEW
+	{dpuINTF1, regVal{0x050, 0}}, // INTF_POLARITY_CTL
+	{dpuINTF1, regVal{0x068, 0}}, // INTF_ACTIVE_DATA_HCTL
+	{dpuINTF1, regVal{0x0a8, 3}}, // INTF_FRAME_LINE_COUNT_EN
+
+	{dpuPP0, regVal{0x30e0, 0}}, // PP_DITHER_EN
+}
+
 // InitDPU replays the mode's scanout pipeline configuration with the
 // VIG0 source repointed at the framebuffer (physical address, laid out
 // with the mode's Stride; SMMUMapMDSS first). The display power domain
 // must be up.
 func InitDPU(m *DisplayMode, fb uint32) {
+	replay(VBIF_BASE, dpuVBIFQoS)
 	replay(DPU_BASE+dpuTop, m.dpuTop)
 	replay(DPU_BASE+dpuCTL0, m.dpuCTL0)
 	replay(DPU_BASE+dpuVIG0, m.dpuVIG0)
@@ -210,38 +275,28 @@ func InitDPU(m *DisplayMode, fb uint32) {
 	replay(DPU_BASE+dpuLM0, m.dpuLM0)
 	replay(DPU_BASE+dpuPP0, m.dpuPP0)
 	replay(DPU_BASE+dpuINTF1, m.dpuINTF1)
+
+	for _, w := range dpuTraceWrites {
+		reg.Write(DPU_BASE+w.block+w.off, w.val)
+	}
 }
 
 // StartDPU flushes the configuration and starts the interface timing
 // engine: pixels begin streaming into the DSI controller.
 func StartDPU() {
-	// The timing engine has to be running before the kickoff, not
-	// after it: a CTL start issued while INTF is still disabled
-	// latches nothing and the counter never leaves line 1.
+	// The order the Linux driver uses (traced from a live bring-up of
+	// this panel): one flush of the pipeline blocks plus the CTL and
+	// the INTF aggregate, then the timing engine enable. Video mode
+	// takes no CTL_START; later frames re-flush without the INTF bit.
+	//
+	// The earlier two-kickoff, engine-first sequence here was a
+	// workaround for INTF_PANEL_FORMAT missing its bit depth fields
+	// (see dpuINTF1Snap): with no valid pixel format the INTF
+	// underruns whatever the order.
+	reg.Write(DPU_BASE+dpuCTL0+ctlIntfFlush, 1<<1) // INTF1
+	reg.Write(DPU_BASE+dpuCTL0+ctlFlush,
+		ctlFlushVIG0|ctlFlushLM0|ctlFlushCTL|ctlFlushINTF)
 	reg.Write(DPU_BASE+dpuINTF1+intfTimingEn, 1)
-
-	// The pipeline takes two kickoffs. The first completes its flush
-	// (CTL_FLUSH reads back zero) yet leaves the timing engine parked
-	// at line 1; only the second starts the scan. A settling delay in
-	// place of the second kick does not work, so the first is arming
-	// state the second consumes rather than losing a vsync race.
-	// Empirical -- the stock driver never trips over it because it
-	// kicks off once per frame regardless.
-	for i := 0; i < 2; i++ {
-		reg.Write(DPU_BASE+dpuCTL0+ctlIntfFlush, 1<<1) // INTF1
-
-		// Flush only the blocks this pipeline drives. A blanket
-		// 0x7fffffff never completes -- blocks that are absent or
-		// unclocked leave their bits pending forever (0x5cc10000
-		// stays latched) -- and, being bits 0..30, it also misses
-		// the bit that matters: bit 31 is the INTF flush aggregate
-		// arming the separate CTL_INTF_FLUSH written above.
-		reg.Write(DPU_BASE+dpuCTL0+ctlFlush,
-			ctlFlushVIG0|ctlFlushLM0|ctlFlushINTF)
-		reg.Write(DPU_BASE+dpuCTL0+ctlStart, 1)
-
-		time.Sleep(20 * time.Millisecond)
-	}
 }
 
 // DPUStatus returns the INTF line count (advancing = scanning) and
