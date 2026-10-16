@@ -82,10 +82,10 @@ var dsiCtrlSnap = []regVal{
 	{0x33c, 0xffffffff},
 }
 
-// InitDSIVideo programs the DSI controller for 1080p60 RGB888 video
-// mode on 4 lanes and starts the video engine. Display power, the DSI
-// PHY/PLL, and the dispcc byte/pixel clocks must already be running.
-func InitDSIVideo() {
+// InitDSIVideo programs the DSI controller for the mode's RGB888 video
+// timing and lane count and starts the video engine. Display power, the
+// DSI PHY/PLL, and the dispcc byte/pixel clocks must already be running.
+func InitDSIVideo(m *DisplayMode) {
 	b := uint32(DSI_CTRL_BASE)
 
 	// soft reset with interface clocks forced on, then replay the
@@ -95,10 +95,12 @@ func InitDSIVideo() {
 	spinDelay(60000) // ~20 ms
 	reg.Write(b+dsiReset, 0)
 
-	replay(b, dsiCtrlSnap)
+	replay(b, m.dsiCtrl)
 
-	reg.Write(b+dsiCTRL, 0x1f1)
-	reg.Write(b+dsiCTRL, 0x1f3)
+	// clock lane + data lanes, enable, then video mode
+	ctrl := 0x100 | m.dsiLaneMask() | 1
+	reg.Write(b+dsiCTRL, ctrl)
+	reg.Write(b+dsiCTRL, ctrl|2)
 
 	// clock-lane HS force LAST (Linux dsi_op_mode_config order):
 	// forcing it before the controller enable starts the clock lane

@@ -123,13 +123,14 @@ func EnableDisplayPower() error {
 // EnableDSIClocks routes the DSI PHY PLL outputs into the display
 // clock tree: byte0 and pclk0 from the PLL (which must be locked), and
 // the escape clock from XO. Call after the PLL reports lock.
-func EnableDSIClocks() error {
+func EnableDSIClocks(m *DisplayMode) error {
 	if err := rcgUpdate(DISPCC_BASE, dispccByte0CmdRCGR, cfgSrcDSI0PLL); err != nil {
 		return errors.New("byte0 rcg: " + err.Error())
 	}
 
-	// byte0_intf divider: /2, as the live system runs it
-	reg.Write(DISPCC_BASE+dispccByte0Div, 1)
+	// byte0_intf divider, as the live system runs the mode (/2 at
+	// 1080p, /1 for the 800x480 panel)
+	reg.Write(DISPCC_BASE+dispccByte0Div, m.byte0IntfDiv)
 
 	if err := rcgUpdate(DISPCC_BASE, dispccPclk0CmdRCGR, cfgSrcDSI0PLL); err != nil {
 		return errors.New("pclk0 rcg: " + err.Error())

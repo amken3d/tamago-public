@@ -10,6 +10,7 @@ package qcm2290
 
 import (
 	"errors"
+	"time"
 
 	"github.com/usbarmory/tamago/internal/reg"
 )
@@ -34,6 +35,11 @@ const (
 	ctlStart     = 0x01c
 	ctlIntfFlush = 0x110
 
+	// CTL_FLUSH block bits (dpu_hw_ctl.c)
+	ctlFlushVIG0 = 1 << 0
+	ctlFlushLM0  = 1 << 6
+	ctlFlushINTF = 1 << 31
+
 	// VIG0 source address registers (repointed)
 	vigSrc0Addr = 0x014
 	vigSrcAddrB = 0x0a4
@@ -41,11 +47,51 @@ const (
 	// INTF timing engine enable (written last)
 	intfTimingEn = 0x000
 
-	// display SMMU (MMU-500): global bypass via sCR0.CLIENTPD --
-	// scanout then fetches physical addresses directly
-	SMMU_BASE    = 0x0c600000
-	smmuSCR0     = 0x0
-	smmuClientPD = 0
+	// INTF line counter; advances while the timing engine scans. Note
+	// 0x0b4 reads back zero even on a live Linux scanout -- it is not
+	// the counter, and reading it makes a working pipeline look dead.
+	intfLineCount = 0x0b0
+
+	// Display SMMU (MMU-500). The secure configuration on this part
+	// permits neither escape hatch: sCR0.CLIENTPD is RAZ/WI (a write
+	// of 1 reads back 0), and an S2CR of TYPE_BYPASS reads back as
+	// TYPE_FAULT. Unmatched streams fault (sCR0.USFCFG is set), and
+	// the boot chain leaves no entry for MDSS, so the first DPU fetch
+	// faults and hangs the bus into a watchdog reset.
+	//
+	// The way through is a real context bank: a bank whose SCTLR.M is
+	// clear has stage-1 translation disabled and forwards addresses
+	// unmodified, which is an identity map for four register writes
+	// and no page tables.
+	SMMU_BASE = 0x0c600000
+
+	smmuSCR0  = 0x000
+	smmuIDR1  = 0x024
+	smmuGFSR  = 0x048
+	smmuSMR0  = 0x800
+	smmuS2CR0 = 0xc00
+	smmuCBAR0 = 0x1000
+
+	// context bank register offsets
+	cbSCTLR = 0x000
+	cbFSR   = 0x058
+
+	// MDSS stream, as the stock DT programs it:
+	// iommus = <&apps_smmu 0x420 0x2>
+	mdssStreamID   = 0x420
+	mdssStreamMask = 0x002
+
+	smrValid = 1 << 31
+
+	// S2CR.TYPE == 0 routes a matched stream to context bank CBNDX.
+	s2crTypeTrans = 0 << 16
+
+	// CBAR.TYPE == 1 (S1_TRANS_S2_BYPASS) plus the memory attributes
+	// the stock driver uses for its own MDSS bank.
+	cbarMDSS = 0x0001f300
+
+	// Banks 0-2 are already spoken for by the boot chain's mappings.
+	mdssCB = 8
 )
 
 var dpuTopSnap = []regVal{
@@ -109,43 +155,99 @@ var dpuINTF1Snap = []regVal{
 // clear: setting it TERMINATES all client transactions, and the DPU's
 // aborted fetch escalates to a fatal NoC error (learned by ramdump).
 // Returns the previous sCR0 value.
-func SMMUBypass() uint32 {
-	old := reg.Read(SMMU_BASE + smmuSCR0)
-	reg.Write(SMMU_BASE+smmuSCR0, old&^(1<<10|1<<0))
+// contextBankBase returns the base address of SMMU context bank n. The
+// bank array follows the global/implementation pages, whose count IDR1
+// reports as 2^(NUMPAGENDXB+1) (64 here, so banks start at +0x40000).
+func contextBankBase(n uint32) uint32 {
+	idr1 := reg.Read(SMMU_BASE + smmuIDR1)
+	numPage := uint32(1) << (((idr1 >> 28) & 0x7) + 1)
 
-	return old
+	return SMMU_BASE + (numPage+n)*0x1000
 }
 
-// InitDPU replays the scanout pipeline configuration with the VIG0
-// source repointed at the framebuffer (physical address; SMMUBypass
-// first). The display power domain must be up.
-func InitDPU(fb uint32) {
-	replay(DPU_BASE+dpuTop, dpuTopSnap)
-	replay(DPU_BASE+dpuCTL0, dpuCTL0Snap)
-	replay(DPU_BASE+dpuVIG0, dpuVIG0Snap)
+// SMMUMapMDSS routes the display stream through a pass-through context
+// bank, so DPU scanout may fetch the framebuffer's physical address.
+// It returns the prior sCR0 for diagnostics. See the register block
+// above for why neither bypass mechanism works on this part.
+func SMMUMapMDSS() uint32 {
+	scr0 := reg.Read(SMMU_BASE + smmuSCR0)
+	cb := contextBankBase(mdssCB)
+
+	// stage-1 translation off: addresses pass through unmodified
+	reg.Write(cb+cbSCTLR, 0)
+	reg.Write(SMMU_BASE+smmuCBAR0+mdssCB*4, cbarMDSS)
+
+	// configure the destination before making the match valid, so no
+	// transaction can land on a half-programmed entry
+	reg.Write(SMMU_BASE+smmuS2CR0+mdssCB*4, s2crTypeTrans|mdssCB)
+	reg.Write(SMMU_BASE+smmuSMR0+mdssCB*4,
+		smrValid|mdssStreamMask<<16|mdssStreamID)
+
+	return scr0
+}
+
+// SMMUFaults returns the global fault status and the MDSS context
+// bank's fault status. Both zero means scanout is being let through.
+func SMMUFaults() (gfsr, cbfsr uint32) {
+	gfsr = reg.Read(SMMU_BASE + smmuGFSR)
+	cbfsr = reg.Read(contextBankBase(mdssCB) + cbFSR)
+
+	return
+}
+
+// InitDPU replays the mode's scanout pipeline configuration with the
+// VIG0 source repointed at the framebuffer (physical address, laid out
+// with the mode's Stride; SMMUMapMDSS first). The display power domain
+// must be up.
+func InitDPU(m *DisplayMode, fb uint32) {
+	replay(DPU_BASE+dpuTop, m.dpuTop)
+	replay(DPU_BASE+dpuCTL0, m.dpuCTL0)
+	replay(DPU_BASE+dpuVIG0, m.dpuVIG0)
 
 	reg.Write(DPU_BASE+dpuVIG0+vigSrc0Addr, fb)
 	reg.Write(DPU_BASE+dpuVIG0+vigSrcAddrB, fb)
 
-	replay(DPU_BASE+dpuLM0, dpuLM0Snap)
-	replay(DPU_BASE+dpuPP0, dpuPP0Snap)
-	replay(DPU_BASE+dpuINTF1, dpuINTF1Snap)
+	replay(DPU_BASE+dpuLM0, m.dpuLM0)
+	replay(DPU_BASE+dpuPP0, m.dpuPP0)
+	replay(DPU_BASE+dpuINTF1, m.dpuINTF1)
 }
 
 // StartDPU flushes the configuration and starts the interface timing
 // engine: pixels begin streaming into the DSI controller.
 func StartDPU() {
-	reg.Write(DPU_BASE+dpuCTL0+ctlIntfFlush, 1<<1) // INTF1
-	reg.Write(DPU_BASE+dpuCTL0+ctlFlush, 0x7fffffff)
-	reg.Write(DPU_BASE+dpuCTL0+ctlStart, 1)
-
+	// The timing engine has to be running before the kickoff, not
+	// after it: a CTL start issued while INTF is still disabled
+	// latches nothing and the counter never leaves line 1.
 	reg.Write(DPU_BASE+dpuINTF1+intfTimingEn, 1)
+
+	// The pipeline takes two kickoffs. The first completes its flush
+	// (CTL_FLUSH reads back zero) yet leaves the timing engine parked
+	// at line 1; only the second starts the scan. A settling delay in
+	// place of the second kick does not work, so the first is arming
+	// state the second consumes rather than losing a vsync race.
+	// Empirical -- the stock driver never trips over it because it
+	// kicks off once per frame regardless.
+	for i := 0; i < 2; i++ {
+		reg.Write(DPU_BASE+dpuCTL0+ctlIntfFlush, 1<<1) // INTF1
+
+		// Flush only the blocks this pipeline drives. A blanket
+		// 0x7fffffff never completes -- blocks that are absent or
+		// unclocked leave their bits pending forever (0x5cc10000
+		// stays latched) -- and, being bits 0..30, it also misses
+		// the bit that matters: bit 31 is the INTF flush aggregate
+		// arming the separate CTL_INTF_FLUSH written above.
+		reg.Write(DPU_BASE+dpuCTL0+ctlFlush,
+			ctlFlushVIG0|ctlFlushLM0|ctlFlushINTF)
+		reg.Write(DPU_BASE+dpuCTL0+ctlStart, 1)
+
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // DPUStatus returns the INTF line count (advancing = scanning) and
 // the CTL flush register (0 = flush consumed).
 func DPUStatus() (line, flush uint32) {
-	line = reg.Read(DPU_BASE + dpuINTF1 + 0x0b4)
+	line = reg.Read(DPU_BASE + dpuINTF1 + intfLineCount)
 	flush = reg.Read(DPU_BASE + dpuCTL0 + ctlFlush)
 
 	return

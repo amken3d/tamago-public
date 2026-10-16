@@ -86,6 +86,16 @@ var phyPLLSnap = []regVal{
 	{0x050, 0x09}, {0x054, 0x02}, {0x05c, 0x10}, {0x068, 0x24},
 	{0x06c, 0x5e}, {0x074, 0x7b}, {0x078, 0x03}, {0x07c, 0x48},
 	{0x080, 0x09}, {0x088, 0x02}, {0x090, 0x5c},
+
+	// Spread-spectrum, which the original capture dropped: SSC_EN_CENTER,
+	// SSC_ADJ_PER1, SSC_PER1/2 and SSC_STEP_SIZE1/2, in both PLL banks
+	// (bank 1 is the same block at +0x200). Every other one of the 448
+	// PHY registers already matched the stock driver.
+	{0x094, 0x01}, {0x098, 0x25}, {0x0a0, 0x30},
+	{0x0a4, 0x01}, {0x0a8, 0xd2}, {0x0ac, 0xec},
+	{0x294, 0x01}, {0x298, 0x25}, {0x2a0, 0x30},
+	{0x2a4, 0x01}, {0x2a8, 0xd2}, {0x2ac, 0xec},
+
 	{0x0bc, 0x0d}, {0x0c0, 0x01}, {0x0c4, 0x12},
 	{0x0d0, 0x1c}, {0x0d4, 0x10}, {0x0e8, 0x10}, {0x0f0, 0x09},
 	{0x0fc, 0x24}, {0x100, 0x1b}, {0x104, 0x03}, {0x10c, 0x10},
@@ -103,10 +113,10 @@ func udelaySpin(n int) {
 	}
 }
 
-// EnableDSIPHY powers up the 14nm DSI PHY lanes and locks the PLL at
-// 1.782 GHz (891 Mbps/lane), the 1080p60 configuration. The display
+// EnableDSIPHY powers up the 14nm DSI PHY lanes and locks the PLL for
+// the display mode (1080p60: 1.782 GHz, 891 Mbps/lane). The display
 // power domain and AHB clocks must already be up (EnableDisplayPower).
-func EnableDSIPHY() error {
+func EnableDSIPHY(m *DisplayMode) error {
 	cmn := uint32(DSI_PHY_CMN_BASE)
 
 	// controller-side PHY interface reset first (msm host reset_phy)
@@ -117,7 +127,7 @@ func EnableDSIPHY() error {
 	// early enables, then the full lane configuration
 	reg.Write(cmn+phyLDO_CNTRL, 0x1c)
 	reg.Write(cmn+phyGLBL_TEST_CTRL, 0x01)
-	replay(DSI_PHY_LANE_BASE, phyLaneSnap)
+	replay(DSI_PHY_LANE_BASE, m.phyLane)
 
 	// digital block reset with the PLL stopped
 	reg.Write(cmn+phyPLL_CNTRL, 0x00)
@@ -128,7 +138,7 @@ func EnableDSIPHY() error {
 	reg.Write(cmn+phyCTRL_0, 0xff) // power up PLL + all lanes
 
 	// PLL configuration (includes frequency, SSC, trims; snapshot)
-	replay(DSI_PLL_BASE, phyPLLSnap)
+	replay(DSI_PLL_BASE, m.phyPLL)
 
 	// PLL software reset
 	reg.Write(cmn+phyPLL_CNTRL, 0x00)
@@ -137,7 +147,7 @@ func EnableDSIPHY() error {
 	reg.Write(cmn+phyCTRL_1, 0x00)
 
 	// CMN static config (clock dividers, LDO, misc)
-	replay(DSI_PHY_CMN_BASE, phyCMNSnap)
+	replay(DSI_PHY_CMN_BASE, m.phyCMN)
 
 	// start + lock
 	reg.Write(cmn+phyPLL_CNTRL, 0x01)
