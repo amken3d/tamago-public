@@ -9,6 +9,7 @@
 package arm64
 
 import (
+	"errors"
 	"runtime"
 
 	"github.com/usbarmory/tamago/internal/reg"
@@ -51,12 +52,17 @@ const (
 	DeviceRegion uint64 = 0b00000000
 	// Normal, Inner/Outer WB/WA/RA
 	MemoryRegion uint64 = 0b11111111
+	// Normal, Inner/Outer Non-cacheable
+	NonCacheableRegion uint64 = 0b01000100
 
-	deviceAttributeIndex = 0
-	memoryAttributeIndex = 1
+	deviceAttributeIndex       = 0
+	memoryAttributeIndex       = 1
+	nonCacheableAttributeIndex = 2
 
 	deviceAttributes = 1<<TTE_AF | TTE_OUTER_SH | TTE_AP_00<<TTE_AP | deviceAttributeIndex<<TTE_ATTR
 	memoryAttributes = 1<<TTE_AF | TTE_INNER_SH | TTE_AP_00<<TTE_AP | memoryAttributeIndex<<TTE_ATTR
+
+	nonCacheableAttributes = 1<<TTE_AF | TTE_OUTER_SH | TTE_AP_00<<TTE_AP | nonCacheableAttributeIndex<<TTE_ATTR
 )
 
 // MMU access permissions
@@ -236,8 +242,10 @@ func (cpu *CPU) InitMMU() {
 	// set memory region attributes
 	//   * attr0: device
 	//   * attr1: memory
+	//   * attr2: non-cacheable memory (SetNonCacheable)
 	write_mair_el1(
-		MemoryRegion<<(8*memoryAttributeIndex) |
+		NonCacheableRegion<<(8*nonCacheableAttributeIndex) |
+			MemoryRegion<<(8*memoryAttributeIndex) |
 			DeviceRegion<<(8*deviceAttributeIndex))
 
 	// set translation control register
@@ -245,4 +253,45 @@ func (cpu *CPU) InitMMU() {
 
 	// enable MMU
 	set_ttbr0_el1(l1pageTableStart)
+}
+
+// SetNonCacheable maps [start, end) as Normal Non-cacheable, non-executable
+// memory, replacing its Device mapping. Use it for memory outside the Go
+// heap that a non-coherent DMA master shares with the CPU (a framebuffer,
+// capture buffers): nothing is cached, so no cache maintenance is needed,
+// but unlike Device memory the CPU may buffer, merge and burst its
+// accesses, which makes bulk copies many times faster. Ordering against
+// Device (MMIO) accesses is not implied; use a barrier where it matters.
+//
+// The range must be 2 MB aligned and lie outside the Go runtime memory
+// region, within the first 1 GB block whose L1 entry InitMMU split into
+// a 2 MB L2 table (the one containing the text segment).
+func (cpu *CPU) SetNonCacheable(start, end uint64) error {
+	const block = 1 << 21
+
+	ramStart, ramEnd := runtime.MemRegion()
+
+	if start%block != 0 || end%block != 0 || end <= start {
+		return errors.New("range not 2 MB aligned")
+	}
+
+	if start < ramEnd && end > ramStart {
+		return errors.New("range overlaps runtime memory")
+	}
+
+	l1 := reg.Read64(ramStart + l1pageTableOffset + 8*(start>>30))
+
+	if l1&0b11 != TTE_TABLE || (end-1)>>30 != start>>30 {
+		return errors.New("range not within a 2 MB mapped 1 GB block")
+	}
+
+	l2 := l1 & 0x0000fffffffff000
+
+	for addr := start; addr < end; addr += block {
+		reg.Write64(l2+8*((addr>>21)&(l2pageTableSize-1)), addr|nonCacheableAttributes|TTE_BLOCK|TTE_EXECUTE_NEVER)
+	}
+
+	flush_tlb()
+
+	return nil
 }
