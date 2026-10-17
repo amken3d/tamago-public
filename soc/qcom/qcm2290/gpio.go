@@ -113,6 +113,11 @@ func (gpio *GPIO) Low() {
 	reg.Clear(gpio.base+GPIO_IN_OUT, GPIO_OUT)
 }
 
+// IsOutput reports whether the pin's output driver is enabled.
+func (gpio *GPIO) IsOutput() bool {
+	return reg.Get(gpio.base+GPIO_CFG, CFG_OE)
+}
+
 // Value returns the pin input level.
 func (gpio *GPIO) Value() bool {
 	return reg.Get(gpio.base+GPIO_IN_OUT, GPIO_IN)

@@ -622,7 +622,13 @@ func (u *GENIFlowUART) Init(baud int) error {
 
 	reg.Write(u.Base+SE_GENI_CGC_CTRL, reg.Read(u.Base+SE_GENI_CGC_CTRL)|0x7f)
 	reg.Write(u.Base+SE_DMA_GENERAL_CFG, reg.Read(u.Base+SE_DMA_GENERAL_CFG)|0xf)
-	reg.Write(u.Base+GENI_OUTPUT_CTRL, 0x7f)
+	// §4.2 step 5 hardware rule: rewriting GENI_OUTPUT_CTRL on a running
+	// engine, even with the 0x7f it already holds, leaves the TX pad
+	// driven low until a reboot; write it only when it is not 0x7f yet
+	if reg.Read(u.Base+GENI_OUTPUT_CTRL)&0x7f != 0x7f {
+		reg.Write(u.Base+GENI_OUTPUT_CTRL, 0x7f)
+	}
+
 	reg.Write(u.Base+GENI_FORCE_DEFAULT_REG, 1)
 
 	reg.Write(u.Base+SE_IRQ_EN, reg.Read(u.Base+SE_IRQ_EN)|0xf)
