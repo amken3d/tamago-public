@@ -19,6 +19,7 @@ package qcm2290
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -397,6 +398,8 @@ type MCUUARTDiag struct {
 	RingUsed, RingHW int // bytes held now / most ever held
 	ReadRestarts     uint32
 	CancelNote       string
+	TxAborts         uint32
+	LastTxAbort      string
 }
 
 // GENIFlowUART is a GENI serial engine in UART mode with RTS/CTS flow
@@ -799,25 +802,54 @@ func (u *GENIFlowUART) Read(buf []byte) (n int, err error) {
 }
 
 // txTimeout bounds one transmit command: the wire time at the current rate
-// four times over, plus a fixed allowance for the MCU holding CTS.
+// four times over, plus 100 ms for the MCU holding CTS. A stalled MCU must
+// cost the caller an error, never its goroutine.
 func (u *GENIFlowUART) txTimeout(n int) time.Duration {
 	baud := u.diag.Plan.Baud
 	if baud <= 0 {
 		baud = 115200
 	}
 
-	return 4*time.Duration(n*10)*time.Second/time.Duration(baud) + 250*time.Millisecond
+	return 4*time.Duration(n*10)*time.Second/time.Duration(baud) + 100*time.Millisecond
 }
 
-func (u *GENIFlowUART) abortTx() {
-	reg.Write(u.Base+SE_GENI_M_CMD_CTRL_REG, GENI_CMD_ABORT)
+// M sequencer cancel done (by analogy with the abort bit the console uses)
+const M_CMD_CANCEL_DONE = 1 << 4
 
-	deadline := time.Now().Add(5 * time.Millisecond)
+// abortTx ends a stalled transmit command: cancel first, abort if the
+// cancel is not acknowledged. It reports what happened.
+func (u *GENIFlowUART) abortTx() string {
+	reg.Write(u.Base+SE_GENI_M_CMD_CTRL_REG, GENI_CMD_CANCEL)
 
-	for reg.Read(u.Base+SE_GENI_M_IRQ_STATUS)&M_CMD_ABORT_DONE == 0 && time.Now().Before(deadline) {
+	note := "transmit command cancelled"
+
+	if !u.waitM(M_CMD_CANCEL_DONE|M_CMD_DONE, 5*time.Millisecond) {
+		reg.Write(u.Base+SE_GENI_M_CMD_CTRL_REG, GENI_CMD_ABORT)
+
+		if u.waitM(M_CMD_ABORT_DONE, 5*time.Millisecond) {
+			note = "transmit command aborted (cancel not acknowledged)"
+		} else {
+			note = "transmit command did not acknowledge cancel or abort"
+		}
 	}
 
 	reg.Write(u.Base+SE_GENI_M_IRQ_CLEAR, 0xffffffff)
+	u.diag.TxAborts++
+	u.diag.LastTxAbort = note
+
+	return note
+}
+
+func (u *GENIFlowUART) waitM(mask uint32, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+
+	for reg.Read(u.Base+SE_GENI_M_IRQ_STATUS)&mask == 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (u *GENIFlowUART) txStall(what string, sent, n int) error {
@@ -825,15 +857,17 @@ func (u *GENIFlowUART) txStall(what string, sent, n int) error {
 	cts := "asserted (MCU ready)"
 
 	if ios&IOS_CTS != 0 {
-		cts = "DEASSERTED (the MCU is holding the host off, or is not driving CTS)"
+		cts = "DEASSERTED (the MCU is holding the host off: not draining its receiver, or not driving CTS)"
 	}
 
-	err := fmt.Errorf("transmit stalled waiting for %s after %d of %d bytes: CTS %s, M_IRQ %#08x, TX FIFO status %#08x",
-		what, sent, n, cts, reg.Read(u.Base+SE_GENI_M_IRQ_STATUS), reg.Read(u.Base+SE_GENI_TX_FIFO_STATUS))
+	mirq := reg.Read(u.Base + SE_GENI_M_IRQ_STATUS)
+	txfs := reg.Read(u.Base + SE_GENI_TX_FIFO_STATUS)
+	rxfs := reg.Read(u.Base + SE_GENI_RX_FIFO_STATUS)
 
-	u.abortTx()
+	note := u.abortTx()
 
-	return err
+	return fmt.Errorf("transmit stalled waiting for %s after %d of %d bytes (%v): CTS %s (IOS %#x), M_IRQ %#08x, TX FIFO status %#08x, RX FIFO status %#08x; %s",
+		what, sent, n, u.txTimeout(n), cts, ios, mirq, txfs, rxfs, note)
 }
 
 // Write transmits buf. Received bytes keep being drained while it waits,
@@ -869,6 +903,7 @@ func (u *GENIFlowUART) Write(buf []byte) (int, error) {
 		for i := 0; i < n; {
 			for reg.Read(u.Base+SE_GENI_M_IRQ_STATUS)&M_TX_FIFO_WM == 0 {
 				u.poll()
+				runtime.Gosched()
 
 				if time.Now().After(deadline) {
 					return sent + i, u.txStall("TX FIFO space", sent+i, len(buf))
@@ -885,6 +920,7 @@ func (u *GENIFlowUART) Write(buf []byte) (int, error) {
 
 		for reg.Read(u.Base+SE_GENI_M_IRQ_STATUS)&M_CMD_DONE == 0 {
 			u.poll()
+			runtime.Gosched()
 
 			if time.Now().After(deadline) {
 				return sent, u.txStall("command done", sent+n, len(buf))
