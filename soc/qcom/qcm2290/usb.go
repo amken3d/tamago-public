@@ -500,6 +500,13 @@ func USBHostInit(pt uint32) (xhciBase uint32, err error) {
 	usbCoreHost()
 	usbWrapperVbus()
 
+	// the USB master's default priority on the system NoC (§7.1): at
+	// the boot chain's 0 a live panel scanout costs the controller
+	// isochronous service intervals
+	if err = SetSNOCQoS(SNOCPortUSB3, SNOCQoSUSB); err != nil {
+		return 0, err
+	}
+
 	if id := reg.Read(USB_BASE + dwc3GSNPSID); id>>16 != 0x5533 {
 		return 0, fmt.Errorf("no DWC3 core answering (GSNPSID %#08x)", id)
 	}
@@ -526,6 +533,9 @@ func USBHostStop() {
 // USBRegs is a snapshot of the USB host bring-up registers.
 type USBRegs struct {
 	GDSC, MasterCBCR, MockUTMICBCR, AHB2PHYCBCR, ControllerBCR uint32
+
+	// SNOC QoS of the USB and display master ports (noc.go, §7.1)
+	SNOCUSB, SNOCDisplay uint32
 
 	GCTL, GSTS, GUCTL1, GUCTL2, GSNPSID, GUSB2PHYCFG, GUSB3PIPECTL uint32
 	GSBUSCFG0, GFLADJ                                              uint32
@@ -556,6 +566,8 @@ func USBHostStatus() (r USBRegs) {
 	r.MockUTMICBCR = reg.Read(GCC_BASE + gccUSB30PrimMockUTMICBCR)
 	r.AHB2PHYCBCR = reg.Read(GCC_BASE + gccAHB2PHYUSBCBCR)
 	r.ControllerBCR = reg.Read(GCC_BASE + gccUSB30PrimBCR)
+	r.SNOCUSB, _ = SNOCQoS(SNOCPortUSB3)
+	r.SNOCDisplay, _ = SNOCQoS(SNOCPortMDP0)
 
 	r.Fuse = usbFuseTrim()
 	r.Restored = usbHostState.restored

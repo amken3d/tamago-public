@@ -95,8 +95,10 @@ var dpuZeroWrites = []RegVal{
 // framebuffer at device address fb (§9.2), without starting it.
 // EnableDPUClock and SMMUMapMDSSIdentity must have been called.
 func InitDPU(m *DisplayMode, fb uint32) {
-	// 1. real-time read QoS for the display fetch
+	// 1. real-time read QoS for the display fetch, and the DPU's
+	// priority on the system NoC (usb-spec §7.1)
 	writeTable(VBIF_BASE, m.VBIF)
+	SetSNOCQoS(SNOCPortMDP0, SNOCQoSDisplay)
 
 	// 2. TOP, CTL0, VIG0
 	writeTable(dpuTop, m.Top)

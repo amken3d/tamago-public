@@ -110,7 +110,12 @@ func EnableCAMSSClocks() error {
 		}
 	}
 
-	return nil
+	// the camera NoC's priorities on the system NoC (usb-spec §7.1)
+	if err := SetSNOCQoS(SNOCPortCamNRT, SNOCQoSCamNRT); err != nil {
+		return err
+	}
+
+	return SetSNOCQoS(SNOCPortCamRT, SNOCQoSCamRT)
 }
 
 // CAMSSClockStatus returns the CBCR of every capture-path branch, in
