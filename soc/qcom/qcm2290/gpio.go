@@ -77,6 +77,20 @@ func (gpio *GPIO) SetPull(pull uint32) {
 	reg.SetN(gpio.base+GPIO_CFG, CFG_PULL, 0b11, pull)
 }
 
+// SetDrive sets the pin drive strength in mA (2 to 16, even values; the
+// field holds mA/2 - 1).
+func (gpio *GPIO) SetDrive(mA int) {
+	if mA < 2 {
+		mA = 2
+	}
+
+	if mA > 16 {
+		mA = 16
+	}
+
+	reg.SetN(gpio.base+GPIO_CFG, CFG_DRV, 0b111, uint32(mA/2-1))
+}
+
 // Out configures the pin as a GPIO output.
 func (gpio *GPIO) Out() {
 	gpio.SelectFunction(0)

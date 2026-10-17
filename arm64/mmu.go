@@ -266,6 +266,10 @@ func (cpu *CPU) InitMMU() {
 // The range must be 2 MB aligned and lie outside the Go runtime memory
 // region, within the first 1 GB block whose L1 entry InitMMU split into
 // a 2 MB L2 table (the one containing the text segment).
+//
+// The TLB invalidation is local to the calling core (TLBI VMALLE1): on a
+// multi-core system call it before any other core shares the tables, or
+// the others keep translating the range with its old attributes.
 func (cpu *CPU) SetNonCacheable(start, end uint64) error {
 	const block = 1 << 21
 

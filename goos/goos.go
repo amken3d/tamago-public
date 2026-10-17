@@ -87,6 +87,13 @@ func Printk(c byte)
 // runtime setup (post World start).
 func Hwinit1()
 
+// NumCPU is the number of hardware processors the runtime should schedule
+// across; it sets the initial GOMAXPROCS. It defaults to 1 (uniprocessor)
+// and must be set before osinit (e.g. in [Hwinit0]) by SMP-capable
+// platforms, which must also provide [Task] (and typically [ProcID] and
+// [Wake]) to start and coordinate the additional processors.
+var NumCPU int32 = 1
+
 // Optional variables/functions.
 var (
 	// Bloc is an optional variable which can be set to redefine the heap
@@ -115,4 +122,78 @@ var (
 	// defined as required to handle [Idle] implementations which halt a
 	// processor.
 	Wake func(procid uint64)
+
+	// PreemptM is an optional function which can be set to deliver an
+	// asynchronous preemption request (an inter-processor interrupt) to
+	// the processor identified by procid, as reported by [ProcID]. The
+	// receiving processor's interrupt handler is expected to notice the
+	// pending request (see [runtime.preemptM]) and bring the interrupted
+	// goroutine to a safe point. Leaving it unset keeps preemption
+	// cooperative-only, the single-processor behaviour.
+	//
+	// The implementation MUST be nosplit-safe: the runtime calls it from
+	// the interrupt handler's time-slice fan-out, on the exception stack.
+	PreemptM func(procid uint64)
+
+	// AsyncPreempt arms the trap-frame preemption tier: with it set, the
+	// interrupt handler redirects an interrupted goroutine through
+	// runtime.asyncPreempt at async-safe points, reaching even loops that
+	// make no calls. Leave unset until the platform's [PreemptM] delivery
+	// is proven; the cooperative poison tier works without it.
+	AsyncPreempt bool
+
+	// SchedTick, when set, points at a counter an ordinary goroutine
+	// advances continuously. It arms the runtime's interrupt-context
+	// deadman (see runtime.tamagoDeadmanCheck): interrupts keep firing
+	// when the scheduler wedges, so a long stretch of interrupts with no
+	// counter advance triggers a lock-free scheduler-state dump. A
+	// bring-up diagnostic; leave nil in normal operation.
+	SchedTick *uint32
+
+	// RawTicks, when set, returns a free-running microsecond-class
+	// counter read with zero locks -- the deadman's clock, so its
+	// starvation window is measured in time rather than interrupt
+	// counts (which race ahead by orders of magnitude in an interrupt
+	// storm). Same contract as RawPutc: MUST be nosplit-safe.
+	RawTicks func() uint32
+
+	// RawPutc, when set, writes one byte to the console bypassing every
+	// lock and buffer -- the deadman's output path, usable when any lock
+	// may be held by a dead core. It MUST be nosplit-safe: a frameless
+	// MMIO poll-and-write, no allocation, no locks.
+	RawPutc func(c byte)
+
+	// IRQAck, when set, is called by the interrupt handler on the
+	// relay-model core before signalling the service goroutine: the
+	// platform acknowledges the sources it can handle entirely in place
+	// (a periodic tick, a wake doorbell) and returns true if NOTHING is
+	// left pending, in which case the handler returns with the interrupt
+	// mask untouched and the service goroutine is not involved. This
+	// keeps the tick -- and the time-slice fan-out riding it -- alive
+	// through a stopped world, when the service goroutine cannot run.
+	// Returning false takes the classic path: relay, and return masked
+	// until serviced. MUST be nosplit-safe.
+	IRQAck func() bool
+
+	// DeadmanHook, when set, is called at the end of the runtime deadman's
+	// dump so the platform can append its own evidence (exception
+	// breadcrumbs, interrupt counters, trapped console buffers). Same
+	// contract as RawPutc: nosplit-safe, no locks, no allocation.
+	DeadmanHook func()
+
+	// Write, when set, replaces per-byte [Printk] for console output:
+	// the runtime delivers each write(2) payload whole. A multiprocessor
+	// platform can then serialize the console at write granularity --
+	// whole fmt.Printf payloads stay contiguous under a lock no matter
+	// which processor carries the writing goroutine -- where byte
+	// granularity would interleave concurrent writers mid-line. Output
+	// printed before the platform assigns the variable still arrives
+	// through [Printk] one byte at a time.
+	//
+	// The runtime calls it from nosplit context, on arbitrary
+	// processors, and during panic: it must not allocate, must not
+	// depend on the scheduler, and must tolerate concurrent callers.
+	// p aliases runtime stack memory and MUST NOT be retained after
+	// the call returns.
+	Write func(p []byte)
 )
