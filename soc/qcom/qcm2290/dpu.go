@@ -104,8 +104,8 @@ func InitDPU(m *DisplayMode, fb uint32) {
 	writeTable(dpuVIG0, m.VIG)
 
 	// 3. framebuffer address, both address registers
-	reg.Write(dpuVIG0+vigSrc0Addr, fb)
-	reg.Write(dpuVIG0+vigSrcAddr2, fb)
+	traceWrite(dpuVIG0+vigSrc0Addr, fb)
+	traceWrite(dpuVIG0+vigSrcAddr2, fb)
 
 	// 4. LM0, PP0, INTF1
 	writeTable(dpuLM0, m.LM)
@@ -113,20 +113,20 @@ func InitDPU(m *DisplayMode, fb uint32) {
 	writeTable(dpuINTF1, m.INTF)
 
 	// the panel format must be written in full whatever a table holds
-	reg.Write(dpuINTF1+intfPanelFormat, intfPanelFormatRGB888)
+	traceWrite(dpuINTF1+intfPanelFormat, intfPanelFormatRGB888)
 
 	// 5. what a snapshot cannot capture
 	for _, w := range dpuZeroWrites {
-		reg.Write(w.Off, w.Val)
+		traceWrite(w.Off, w.Val)
 	}
 }
 
 // StartDPU flushes the configuration and starts INTF1's timing engine
 // (§9.3). Video mode has no CTL_START.
 func StartDPU() {
-	reg.Write(dpuCTL0+ctlIntfFlush, ctlIntf1)
-	reg.Write(dpuCTL0+ctlFlush, ctlFlushStart)
-	reg.Write(dpuINTF1+intfTimingEngineEn, 1)
+	traceWrite(dpuCTL0+ctlIntfFlush, ctlIntf1)
+	traceWrite(dpuCTL0+ctlFlush, ctlFlushStart)
+	traceWrite(dpuINTF1+intfTimingEngineEn, 1)
 }
 
 // StopDPU stops INTF1's timing engine and waits, up to about 100 ms,
@@ -135,9 +135,9 @@ func StartDPU() {
 // start (CTL_INTF_FLUSH, CTL_FLUSH INTF bit), because a USB-C mode
 // engine was seen to keep running after the bare disable write.
 func StopDPU() bool {
-	reg.Write(dpuINTF1+intfTimingEngineEn, 0)
-	reg.Write(dpuCTL0+ctlIntfFlush, ctlIntf1)
-	reg.Write(dpuCTL0+ctlFlush, 1<<31)
+	traceWrite(dpuINTF1+intfTimingEngineEn, 0)
+	traceWrite(dpuCTL0+ctlIntfFlush, ctlIntf1)
+	traceWrite(dpuCTL0+ctlFlush, 1<<31)
 
 	last := reg.Read(dpuINTF1 + intfLineCount)
 
@@ -159,18 +159,18 @@ func StopDPU() bool {
 // SetDPUFramebuffer points VIG0 at another framebuffer and flushes the
 // update (without the INTF bit, §9.3).
 func SetDPUFramebuffer(fb uint32) {
-	reg.Write(dpuVIG0+vigSrc0Addr, fb)
-	reg.Write(dpuVIG0+vigSrcAddr2, fb)
-	reg.Write(dpuCTL0+ctlFlush, ctlFlushUpdate)
+	traceWrite(dpuVIG0+vigSrc0Addr, fb)
+	traceWrite(dpuVIG0+vigSrcAddr2, fb)
+	traceWrite(dpuCTL0+ctlFlush, ctlFlushUpdate)
 }
 
 // SetDPUUnderflowColor sets the colour INTF1 shows on underrun (packing
 // B[7:0], R[15:8], G[23:16]) and flushes it: if the screen changes
 // colour, it shows underrun, not pixels (§11).
 func SetDPUUnderflowColor(c uint32) {
-	reg.Write(dpuINTF1+intfUnderflowColor, c)
-	reg.Write(dpuCTL0+ctlIntfFlush, ctlIntf1)
-	reg.Write(dpuCTL0+ctlFlush, ctlFlushStart)
+	traceWrite(dpuINTF1+intfUnderflowColor, c)
+	traceWrite(dpuCTL0+ctlIntfFlush, ctlIntf1)
+	traceWrite(dpuCTL0+ctlFlush, ctlFlushStart)
 }
 
 // DPUStatus returns INTF1's line counter (advancing = scanning) and
@@ -188,7 +188,7 @@ func DPUIntrStatus() uint32 {
 // ClearDPUIntr clears the latched TOP interrupt status, so that a later
 // DPUIntrStatus shows only new events.
 func ClearDPUIntr() {
-	reg.Write(dpuTop+topIntrClear, reg.Read(dpuTop+topIntrStatus))
+	traceWrite(dpuTop+topIntrClear, reg.Read(dpuTop+topIntrStatus))
 }
 
 // DPUHealth is a DPU snapshot for diagnostics (§9.4).

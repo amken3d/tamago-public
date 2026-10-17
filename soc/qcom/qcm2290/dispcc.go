@@ -57,8 +57,8 @@ func pollTime(addr, mask, want uint32, timeout time.Duration) bool {
 // 10:8, divider 2 x div - 1 in bits 4:0) and commits it through the CMD
 // register, waiting for the hardware to clear the update bit (§2).
 func rcgUpdate(base, cmd, cfg uint32) error {
-	reg.Write(base+cmd+rcgCfg, cfg)
-	reg.Write(base+cmd, reg.Read(base+cmd)|rcgCmdUpdate)
+	traceWrite(base+cmd+rcgCfg, cfg)
+	traceWrite(base+cmd, reg.Read(base+cmd)|rcgCmdUpdate)
 
 	if !pollTime(base+cmd, rcgCmdUpdate, 0, clkPollTime) {
 		return fmt.Errorf("RCG %#x update timeout (cmd %#x)", base+cmd, reg.Read(base+cmd))
@@ -70,7 +70,7 @@ func rcgUpdate(base, cmd, cfg uint32) error {
 // dispClkOn enables a branch clock and waits for its off status bit to
 // clear (§2).
 func dispClkOn(base, cbcr uint32) error {
-	reg.Write(base+cbcr, reg.Read(base+cbcr)|cbcrEnable)
+	traceWrite(base+cbcr, reg.Read(base+cbcr)|cbcrEnable)
 
 	if !pollTime(base+cbcr, cbcrOff, 0, clkPollTime) {
 		return fmt.Errorf("branch %#x stuck off (%#x)", base+cbcr, reg.Read(base+cbcr))
@@ -83,13 +83,13 @@ func dispClkOn(base, cbcr uint32) error {
 // dynamic gating (§2, §5.1): the enable is written and the status is
 // not waited on.
 func clkOnAdvisory(base, cbcr, set uint32) {
-	reg.Write(base+cbcr, reg.Read(base+cbcr)|set)
+	traceWrite(base+cbcr, reg.Read(base+cbcr)|set)
 }
 
 // gdscOn powers a GDSC power domain: software collapse off, then wait
 // for power on (§2).
 func gdscOn(base, gdsc uint32) error {
-	reg.Write(base+gdsc, reg.Read(base+gdsc)&^gdscCollapse)
+	traceWrite(base+gdsc, reg.Read(base+gdsc)&^gdscCollapse)
 
 	if !pollTime(base+gdsc, gdscPwrOn, gdscPwrOn, clkPollTime) {
 		return fmt.Errorf("GDSC %#x power-on timeout (%#x)", base+gdsc, reg.Read(base+gdsc))
@@ -172,18 +172,18 @@ func EnableDPUClock(m *DisplayMode) error {
 	pll := uint32(DISPCC_BASE)
 
 	if reg.Read(pll+dispccPLL0Mode)&pll0Lock == 0 {
-		reg.Write(pll+dispccPLL0L, 0x28)
-		reg.Write(pll+dispccPLL0ConfigCtl, 0x00200001)
-		reg.Write(pll+dispccPLL0ConfigHi, 0x00000004)
-		reg.Write(pll+dispccPLL0UserCtl, 0x4001055b)
+		traceWrite(pll+dispccPLL0L, 0x28)
+		traceWrite(pll+dispccPLL0ConfigCtl, 0x00200001)
+		traceWrite(pll+dispccPLL0ConfigHi, 0x00000004)
+		traceWrite(pll+dispccPLL0UserCtl, 0x4001055b)
 
 		mode := reg.Read(pll + dispccPLL0Mode)
 		mode |= pll0BypassOff
-		reg.Write(pll+dispccPLL0Mode, mode)
+		traceWrite(pll+dispccPLL0Mode, mode)
 		time.Sleep(10 * time.Microsecond)
 
 		mode |= pll0ResetRelease
-		reg.Write(pll+dispccPLL0Mode, mode)
+		traceWrite(pll+dispccPLL0Mode, mode)
 		time.Sleep(50 * time.Microsecond)
 
 		if !pollTime(pll+dispccPLL0Mode, pll0Lock, pll0Lock, clkPollTime) {
@@ -191,7 +191,7 @@ func EnableDPUClock(m *DisplayMode) error {
 		}
 	}
 
-	reg.Write(pll+dispccPLL0Mode, reg.Read(pll+dispccPLL0Mode)|pll0OutputOn)
+	traceWrite(pll+dispccPLL0Mode, reg.Read(pll+dispccPLL0Mode)|pll0OutputOn)
 
 	if err := rcgUpdate(DISPCC_BASE, dispccMDPCmdRCGR, m.MDPCfg); err != nil {
 		return fmt.Errorf("mdp root: %v", err)
@@ -218,7 +218,7 @@ func EnableDSILinkClocks(m *DisplayMode) error {
 		return fmt.Errorf("byte root: %v", err)
 	}
 
-	reg.Write(DISPCC_BASE+dispccByteIntfDiv, m.ByteIntfDiv)
+	traceWrite(DISPCC_BASE+dispccByteIntfDiv, m.ByteIntfDiv)
 
 	if err := rcgUpdate(DISPCC_BASE, dispccPixelCmdRCGR, m.PixelCfg); err != nil {
 		return fmt.Errorf("pixel root: %v", err)

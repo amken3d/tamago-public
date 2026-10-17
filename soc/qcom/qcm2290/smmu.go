@@ -101,7 +101,7 @@ func identityBank(cb uint32, pt uint32) error {
 
 	b := contextBankBase(cb)
 
-	reg.Write(b+cbSCTLR, 0)
+	traceWrite(b+cbSCTLR, 0)
 
 	// level-1 descriptors, written as aligned words: the table page
 	// may be device memory to the CPU
@@ -112,27 +112,27 @@ func identityBank(cb uint32, pt uint32) error {
 			d = uint64(i)<<30 | 1<<10 | 1<<6 | 0b01
 		}
 
-		reg.Write(pt+8*i, uint32(d))
-		reg.Write(pt+8*i+4, uint32(d>>32))
+		traceWrite(pt+8*i, uint32(d))
+		traceWrite(pt+8*i+4, uint32(d>>32))
 	}
 
-	reg.Write(SMMU_BASE+smmuCBAR0+4*cb, cbarS1Bypass2)
-	reg.Write(SMMU_BASE+smmuCBA2R0+4*cb, cba2rVA64)
+	traceWrite(SMMU_BASE+smmuCBAR0+4*cb, cbarS1Bypass2)
+	traceWrite(SMMU_BASE+smmuCBA2R0+4*cb, cba2rVA64)
 
-	reg.Write(b+cbTCR2, cbTCR2Value)
-	reg.Write(b+cbMAIR0, cbMAIR0Value)
-	reg.Write64(uint64(b+cbTTBR0), uint64(pt))
-	reg.Write(b+cbTCR, cbTCRValue)
+	traceWrite(b+cbTCR2, cbTCR2Value)
+	traceWrite(b+cbMAIR0, cbMAIR0Value)
+	traceWrite64(uint64(b+cbTTBR0), uint64(pt))
+	traceWrite(b+cbTCR, cbTCRValue)
 
-	reg.Write(b+cbTLBIASID, 0)
-	reg.Write(b+cbTLBSYNC, 0)
+	traceWrite(b+cbTLBIASID, 0)
+	traceWrite(b+cbTLBSYNC, 0)
 
 	if !pollTime(b+cbTLBSTATUS, 1, 0, 10*time.Millisecond) {
 		return fmt.Errorf("context bank %d TLB sync timeout", cb)
 	}
 
-	reg.Write(b+cbFSR, reg.Read(b+cbFSR))
-	reg.Write(b+cbSCTLR, cbSCTLRValue)
+	traceWrite(b+cbFSR, reg.Read(b+cbFSR))
+	traceWrite(b+cbSCTLR, cbSCTLRValue)
 
 	return nil
 }
@@ -151,14 +151,14 @@ func SMMUMapMDSSIdentity(pt uint32) error {
 		return fmt.Errorf("stream match group %d in use (SMR %#x S2CR %#x)", mdssSMR, smr, s2cr)
 	}
 
-	reg.Write(SMMU_BASE+smmuSMR0+4*mdssSMR, 0)
+	traceWrite(SMMU_BASE+smmuSMR0+4*mdssSMR, 0)
 
 	if err := identityBank(mdssCB, pt); err != nil {
 		return err
 	}
 
-	reg.Write(SMMU_BASE+smmuS2CR0+4*mdssSMR, s2crTypeTrans|mdssCB)
-	reg.Write(SMMU_BASE+smmuSMR0+4*mdssSMR, smrValid|mdssStreamMask<<16|mdssStreamID)
+	traceWrite(SMMU_BASE+smmuS2CR0+4*mdssSMR, s2crTypeTrans|mdssCB)
+	traceWrite(SMMU_BASE+smmuSMR0+4*mdssSMR, smrValid|mdssStreamMask<<16|mdssStreamID)
 
 	return nil
 }

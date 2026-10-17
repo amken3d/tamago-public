@@ -44,7 +44,7 @@ const (
 // writeTable writes a register table at a block base, in order.
 func writeTable(base uint32, t []RegVal) {
 	for _, r := range t {
-		reg.Write(base+r.Off, r.Val)
+		traceWrite(base+r.Off, r.Val)
 	}
 }
 
@@ -54,44 +54,44 @@ func writeTable(base uint32, t []RegVal) {
 // EnableDisplayPower must have been called.
 func InitDSIPHY(m *DisplayMode) error {
 	// 1. controller PHY-interface reset
-	reg.Write(DSI0_BASE+dsiPHYReset, 0x01000001)
+	traceWrite(DSI0_BASE+dsiPHYReset, 0x01000001)
 	time.Sleep(100 * time.Microsecond)
-	reg.Write(DSI0_BASE+dsiPHYReset, 0)
+	traceWrite(DSI0_BASE+dsiPHYReset, 0)
 
 	// 2. LDO and global test control
-	reg.Write(DSIPHY_BASE+phyLDOCntrl, 0x1c)
-	reg.Write(DSIPHY_BASE+phyGlblTestCtrl, 0x01)
+	traceWrite(DSIPHY_BASE+phyLDOCntrl, 0x1c)
+	traceWrite(DSIPHY_BASE+phyGlblTestCtrl, 0x01)
 
 	// 3. lanes
 	writeTable(DSILANE_BASE, m.PHYLanes)
 
 	// 4. digital reset with the PLL stopped
-	reg.Write(DSIPHY_BASE+phyPLLCntrl, 0)
-	reg.Write(DSIPHY_BASE+phyCtrl1, 0x80)
+	traceWrite(DSIPHY_BASE+phyPLLCntrl, 0)
+	traceWrite(DSIPHY_BASE+phyCtrl1, 0x80)
 	time.Sleep(100 * time.Microsecond)
-	reg.Write(DSIPHY_BASE+phyCtrl1, 0)
+	traceWrite(DSIPHY_BASE+phyCtrl1, 0)
 
 	// 5. PLL and all lanes powered
-	reg.Write(DSIPHY_BASE+phyCtrl0, 0xff)
+	traceWrite(DSIPHY_BASE+phyCtrl0, 0xff)
 
 	// 6. PLL frequency, spread spectrum, trims
 	writeTable(DSIPLL_BASE, m.PLL)
 
 	// 7. PLL software reset
-	reg.Write(DSIPHY_BASE+phyPLLCntrl, 0)
-	reg.Write(DSIPHY_BASE+phyCtrl1, 0x20)
+	traceWrite(DSIPHY_BASE+phyPLLCntrl, 0)
+	traceWrite(DSIPHY_BASE+phyCtrl1, 0x20)
 	time.Sleep(10 * time.Microsecond)
-	reg.Write(DSIPHY_BASE+phyCtrl1, 0)
+	traceWrite(DSIPHY_BASE+phyCtrl1, 0)
 
 	// 8. common registers, never PLL_CNTRL from a table
 	for _, r := range m.PHYCommon {
 		if r.Off != phyPLLCntrl {
-			reg.Write(DSIPHY_BASE+r.Off, r.Val)
+			traceWrite(DSIPHY_BASE+r.Off, r.Val)
 		}
 	}
 
 	// 9. start the PLL
-	reg.Write(DSIPHY_BASE+phyPLLCntrl, 1)
+	traceWrite(DSIPHY_BASE+phyPLLCntrl, 1)
 
 	if !pollTime(DSIPLL_BASE+pllStatus, pllStatusLocked, pllStatusLocked, pllLockTimeout) {
 		return fmt.Errorf("DSI PLL lock timeout (status %#x)", reg.Read(DSIPLL_BASE+pllStatus))

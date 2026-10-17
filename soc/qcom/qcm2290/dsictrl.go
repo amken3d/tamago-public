@@ -84,40 +84,40 @@ const (
 // The clock lane is forced to HS last: forcing it before the enable
 // starts the clock lane in a bad state.
 func StartDSIVideo(m *DisplayMode) {
-	reg.Write(DSI0_BASE+dsiClkCtrl, dsiClkForceOn)
-	reg.Write(DSI0_BASE+dsiReset, 1)
+	traceWrite(DSI0_BASE+dsiClkCtrl, dsiClkForceOn)
+	traceWrite(DSI0_BASE+dsiReset, 1)
 	time.Sleep(20 * time.Millisecond)
-	reg.Write(DSI0_BASE+dsiReset, 0)
+	traceWrite(DSI0_BASE+dsiReset, 0)
 
 	writeTable(DSI0_BASE, m.DSI)
 
 	ctrl := m.ctrlLanes() | dsiCtrlEnable
-	reg.Write(DSI0_BASE+dsiCtrl, ctrl)
-	reg.Write(DSI0_BASE+dsiCtrl, ctrl|dsiCtrlVideo)
+	traceWrite(DSI0_BASE+dsiCtrl, ctrl)
+	traceWrite(DSI0_BASE+dsiCtrl, ctrl|dsiCtrlVideo)
 
-	reg.Write(DSI0_BASE+dsiLaneCtrl, dsiLaneForceHSCk)
+	traceWrite(DSI0_BASE+dsiLaneCtrl, dsiLaneForceHSCk)
 }
 
 // StopDSI disables the controller (CTRL = 0) and releases the clock
 // lane force.
 func StopDSI() {
-	reg.Write(DSI0_BASE+dsiLaneCtrl, 0)
-	reg.Write(DSI0_BASE+dsiCtrl, 0)
+	traceWrite(DSI0_BASE+dsiLaneCtrl, 0)
+	traceWrite(DSI0_BASE+dsiCtrl, 0)
 }
 
 // DSITestPattern turns the controller's own checkered test pattern on
 // or off (§7.2); it replaces the DPU as the pixel source.
 func DSITestPattern(on bool) {
 	if !on {
-		reg.Write(DSI0_BASE+dsiTPGCtrl, 0)
+		traceWrite(DSI0_BASE+dsiTPGCtrl, 0)
 		return
 	}
 
-	reg.Write(DSI0_BASE+dsiTPGInitVal, 0xff)
-	reg.Write(DSI0_BASE+dsiTPGMainCtrl, 0x100)
-	reg.Write(DSI0_BASE+dsiTPGVideoCfg, 0x5)
-	reg.Write(DSI0_BASE+dsiTPGCtrl, 0x30)
-	reg.Write(DSI0_BASE+dsiTPGCtrl, 0x31)
+	traceWrite(DSI0_BASE+dsiTPGInitVal, 0xff)
+	traceWrite(DSI0_BASE+dsiTPGMainCtrl, 0x100)
+	traceWrite(DSI0_BASE+dsiTPGVideoCfg, 0x5)
+	traceWrite(DSI0_BASE+dsiTPGCtrl, 0x30)
+	traceWrite(DSI0_BASE+dsiTPGCtrl, 0x31)
 }
 
 // SendDSICommand transmits the command packets in a memory buffer by
@@ -130,9 +130,9 @@ func SendDSICommand(addr uint32, length int, lp bool) error {
 	}
 
 	ctrl := reg.Read(DSI0_BASE + dsiCtrl)
-	defer reg.Write(DSI0_BASE+dsiCtrl, ctrl)
+	defer traceWrite(DSI0_BASE+dsiCtrl, ctrl)
 
-	reg.Write(DSI0_BASE+dsiCtrl, ctrl|dsiCtrlEnable|dsiCtrlCmd)
+	traceWrite(DSI0_BASE+dsiCtrl, ctrl|dsiCtrlEnable|dsiCtrlCmd)
 
 	dma := reg.Read(DSI0_BASE + dsiCmdDMACtrl)
 
@@ -142,22 +142,22 @@ func SendDSICommand(addr uint32, length int, lp bool) error {
 		dma &^= dsiDMACtrlLP
 	}
 
-	reg.Write(DSI0_BASE+dsiCmdDMACtrl, dma)
-	reg.Write(DSI0_BASE+dsiTrigCtrl, dsiTrigSWDMA)
+	traceWrite(DSI0_BASE+dsiCmdDMACtrl, dma)
+	traceWrite(DSI0_BASE+dsiTrigCtrl, dsiTrigSWDMA)
 
 	// clear and unmask command DMA done
-	reg.Write(DSI0_BASE+dsiIntrCtrl, reg.Read(DSI0_BASE+dsiIntrCtrl)|dsiIntrDMADone|dsiIntrDMADoneMask)
+	traceWrite(DSI0_BASE+dsiIntrCtrl, reg.Read(DSI0_BASE+dsiIntrCtrl)|dsiIntrDMADone|dsiIntrDMADoneMask)
 
-	reg.Write(DSI0_BASE+dsiDMABase, addr)
-	reg.Write(DSI0_BASE+dsiDMALen, uint32(length))
-	reg.Write(DSI0_BASE+dsiTrigDMA, 1)
+	traceWrite(DSI0_BASE+dsiDMABase, addr)
+	traceWrite(DSI0_BASE+dsiDMALen, uint32(length))
+	traceWrite(DSI0_BASE+dsiTrigDMA, 1)
 
 	if !pollTime(DSI0_BASE+dsiIntrCtrl, dsiIntrDMADone, dsiIntrDMADone, dsiCmdTimeout) {
 		return fmt.Errorf("command DMA timeout (status %#x intr %#x)",
 			reg.Read(DSI0_BASE+dsiStatus0), reg.Read(DSI0_BASE+dsiIntrCtrl))
 	}
 
-	reg.Write(DSI0_BASE+dsiIntrCtrl, reg.Read(DSI0_BASE+dsiIntrCtrl)|dsiIntrDMADone)
+	traceWrite(DSI0_BASE+dsiIntrCtrl, reg.Read(DSI0_BASE+dsiIntrCtrl)|dsiIntrDMADone)
 
 	return nil
 }
@@ -200,7 +200,7 @@ func DSIHealthStatus() (h DSIHealth) {
 // so that a later DSIHealthStatus shows only new events (the error bit
 // was seen latched, not recurring, after a switch back from USB-C).
 func ClearDSIStatus() {
-	reg.Write(DSI0_BASE+dsiFIFOStatus, reg.Read(DSI0_BASE+dsiFIFOStatus))
-	reg.Write(DSI0_BASE+dsiTimeoutStatus, reg.Read(DSI0_BASE+dsiTimeoutStatus))
-	reg.Write(DSI0_BASE+dsiIntrCtrl, reg.Read(DSI0_BASE+dsiIntrCtrl))
+	traceWrite(DSI0_BASE+dsiFIFOStatus, reg.Read(DSI0_BASE+dsiFIFOStatus))
+	traceWrite(DSI0_BASE+dsiTimeoutStatus, reg.Read(DSI0_BASE+dsiTimeoutStatus))
+	traceWrite(DSI0_BASE+dsiIntrCtrl, reg.Read(DSI0_BASE+dsiIntrCtrl))
 }
