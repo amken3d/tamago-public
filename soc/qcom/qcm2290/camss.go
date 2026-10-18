@@ -57,8 +57,9 @@ const (
 	cfgGPLL0Aux2Div3    = 2<<8 | 5 // 300 MHz / 3 = 100 MHz
 	cfgXOBypass         = 0        // 19.2 MHz
 
-	// CSIPHYTimerHz is the PHY timer rate set by EnableCAMSSClocks,
-	// which the settle count is counted in (§3.3).
+	// CSIPHYTimerHz is the PHY timer rate set by EnableCAMSSClocks
+	// (§2.2). Start may raise it for a fast link (§2.2.1) and counts the
+	// settle count in the rate it set (CAMSS.Rates).
 	CSIPHYTimerHz = 100_000_000
 )
 
@@ -389,8 +390,14 @@ const (
 // CaptureConfig describes the stream to capture on CAMERA0.
 type CaptureConfig struct {
 	// Lanes is the number of data lanes, on PHY lane positions 0 to
-	// Lanes-1 (1-4).
+	// Lanes-1 (1-4) unless PHYLanes says otherwise.
 	Lanes int
+	// PHYLanes, when not nil, names the PHY lane position (0-3) feeding
+	// each CSID lane, in CSID lane order: the CSID's lane input select
+	// (one nibble per CSID lane, §4.1 CSI2_RX_CFG0 bits 17:4) and the
+	// PHY's lane enables (COMMON_CTRL5, data lane at position p = bit 2p,
+	// §3.1). {1, 0} swaps the two lanes of a 2-lane sensor.
+	PHYLanes []int
 	// LinkHz is the CSI-2 clock lane frequency, for the settle count.
 	LinkHz uint64
 	// Settle, when not zero, overrides the settle count computed from
@@ -402,6 +409,15 @@ type CaptureConfig struct {
 	// RAW10 line is Width x 10 / 8 bytes.
 	Stride int
 	Height int
+	// PixelRate is the rate pixels reach the receiver, per second, and
+	// BPP their bits each: the TFE core's minimum rate (§2.2.1). 0 keeps
+	// the TFE core at its §2.2 rate.
+	PixelRate uint64
+	BPP       int
+	// TFEMinHz, when not zero, raises the TFE core's minimum to at least
+	// this rate (bench diagnostics: run the core faster than the rule
+	// asks).
+	TFEMinHz uint64
 }
 
 // CAMSS represents the raw capture path of one camera port.
@@ -411,6 +427,7 @@ type CAMSS struct {
 	TFE  uint32
 
 	settle uint32
+	rates  CAMSSRates
 }
 
 // Camera0 is CAMERA0's path: PHY 0, CSID 0, TFE 0.
@@ -509,10 +526,37 @@ func (c *CAMSS) Start(cfg CaptureConfig, buf0, buf1 uint32) error {
 		return errors.New("invalid frame geometry")
 	}
 
+	phyLanes := cfg.PHYLanes
+
+	if phyLanes == nil {
+		for l := 0; l < cfg.Lanes; l++ {
+			phyLanes = append(phyLanes, l)
+		}
+	}
+
+	if len(phyLanes) != cfg.Lanes {
+		return fmt.Errorf("%d PHY lanes named for %d data lanes", len(phyLanes), cfg.Lanes)
+	}
+
+	for _, p := range phyLanes {
+		if p < 0 || p > 3 {
+			return fmt.Errorf("PHY lane %d (0-3)", p)
+		}
+	}
+
+	// the scaling roots for this mode (§2.2.1), before any block is
+	// configured; the settle count is counted in the timer rate set
+	rates, err := setCAMSSRates(cfg.LinkHz, cfg.PixelRate, cfg.BPP, cfg.TFEMinHz)
+
+	if err != nil {
+		return err
+	}
+
+	c.rates = rates
 	c.settle = cfg.Settle
 
 	if c.settle == 0 {
-		c.settle = CSIPHYSettleCountMid(cfg.LinkHz, CSIPHYTimerHz)
+		c.settle = CSIPHYSettleCountMid(cfg.LinkHz, rates.TimerHz)
 	}
 
 	// TFE: write master 7 (§5.2 steps 4-10)
@@ -536,11 +580,11 @@ func (c *CAMSS) Start(cfg CaptureConfig, buf0, buf1 uint32) error {
 	c.Queue(buf0)
 	c.Queue(buf1)
 
-	// CSID: RDI0 from PHY lanes 0..Lanes-1 (§4.2 steps 4-7)
+	// CSID: RDI0 from the PHY lanes (§4.2 steps 4-7)
 	var laneSel uint32
 
-	for l := 0; l < cfg.Lanes; l++ {
-		laneSel |= uint32(l) << (4 * l)
+	for l, p := range phyLanes {
+		laneSel |= uint32(p) << (4 * l)
 	}
 
 	reg.Write(c.CSID+csidRXCfg0, uint32(cfg.Lanes-1)|laneSel<<4|(0+1)<<20)
@@ -551,7 +595,7 @@ func (c *CAMSS) Start(cfg CaptureConfig, buf0, buf1 uint32) error {
 	// PHY: lane enable (§3.2 steps 3-8)
 	lanes := uint32(phyClockLaneBit)
 
-	for p := 0; p < cfg.Lanes; p++ {
+	for _, p := range phyLanes {
 		lanes |= 1 << (2 * p)
 	}
 
@@ -586,6 +630,11 @@ func (c *CAMSS) laneGroup(g uint32, writes []phyLaneWrite) {
 
 		reg.Write(base+w.off, val)
 	}
+}
+
+// Rates returns the scaling roots' rates set by the last Start.
+func (c *CAMSS) Rates() CAMSSRates {
+	return c.rates
 }
 
 // Settle returns the settle count programmed by the last Start.
