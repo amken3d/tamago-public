@@ -406,7 +406,8 @@ type CaptureConfig struct {
 	// DT is the CSI-2 data type (RAW10 = 0x2b).
 	DT uint8
 	// Stride and Height give the bytes per frame (Stride x Height); a
-	// RAW10 line is Width x 10 / 8 bytes.
+	// RAW10 line is Width x 10 / 8 bytes, and must be a multiple of 4
+	// (§6: for RAW10, a width that is a multiple of 16 pixels).
 	Stride int
 	Height int
 	// PixelRate is the rate pixels reach the receiver, per second, and
@@ -524,6 +525,13 @@ func (c *CAMSS) Start(cfg CaptureConfig, buf0, buf1 uint32) error {
 
 	if cfg.Stride <= 0 || cfg.Height <= 0 {
 		return errors.New("invalid frame geometry")
+	}
+
+	// A line that is not a whole number of 32-bit words is written short
+	// (§6, hardware observation): refuse it rather than deliver frames
+	// that end early.
+	if cfg.Stride%4 != 0 {
+		return fmt.Errorf("a %d-byte line is not a whole number of 32-bit words: the write master ends such frames early (camss-spec §6)", cfg.Stride)
 	}
 
 	phyLanes := cfg.PHYLanes
