@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/usbarmory/tamago/internal/reg"
+	"github.com/usbarmory/tamago/soc/qcom/qcm2290/se2clk"
 )
 
 // QUPv3 wrapper 0 and serial engine 2 (§1)
@@ -170,34 +171,45 @@ func inDFSTable(hz uint64) bool {
 // register reading 0x8020, and the root then runs from its own CFG).
 const dfsEnable = 1 << 0
 
-// rootCfgOff is the RCG CFG register, 4 bytes after CMD (display-spec
-// §2 conventions).
-const rootCfgOff = 0x4
+// Root registers relative to CMD (§2.1).
+const (
+	rootCfgOff = 0x4
+	rootMOff   = 0x8
+	rootNOff   = 0xc
+	rootDOff   = 0x10
+
+	rootCmdUpdate  = 1 << 0
+	rootCmdRootOff = 1 << 31
+
+	rootUpdateTimeout = 500 * time.Microsecond
+)
 
 // DFSEnabled reports whether a current-level register value has DFS on.
 func DFSEnabled(current uint32) bool { return current&dfsEnable != 0 }
 
-// decodeRootCfg describes the root's single rate when DFS is off, from its
-// CFG register. Only the crystal (source 0) with the pre-divider is
-// decoded: the source numbering of GPLL0's outputs and the M/N/D register
-// layout of this root are not established, so either is refused.
+// decodeRootCfg describes the root's own configuration when DFS is off
+// (§2.1): CFG, M and N decoded into a source, divider and m/n. The level
+// is valid when the source's rate is known (§2.1's source table); the
+// rate need not be one of the table's, since this is what the root runs
+// at, not a choice.
 func decodeRootCfg(base uint32) DFSLevel {
 	l := DFSLevel{Index: 0, Cfg: reg.Read(base + rootCfgOff)}
 
-	l.Src = (l.Cfg >> 8) & 0x7
-	l.PreDiv = l.Cfg & 0x1f
-	l.MN = (l.Cfg>>12)&0x3 != 0
+	m := reg.Read(base + rootMOff)
+	n := reg.Read(base + rootNOff)
+	r := se2clk.Decode(l.Cfg, m, n)
 
-	switch {
-	case l.Src != 0:
-		l.Note = fmt.Sprintf("DFS off; root CFG selects source %d, whose rate is not established (only the 19.2 MHz crystal, source 0, is)", l.Src)
-	case l.MN:
-		l.Note = "DFS off; root CFG has M/N in use, whose register layout is not established"
-	default:
-		l.SrcHz = xoHz
-		l.Hz = l.rate(xoHz)
-		l.Valid = true
-		l.Note = "DFS off: the root's own CFG (crystal)"
+	l.Src = r.Src
+	l.PreDiv = l.Cfg & 0x1f
+	l.MN = r.UsesMN()
+	l.M, l.NReg, l.N = m&0xffff, n, r.N
+	l.SrcHz = se2clk.SourceHz[r.Src]
+	l.Hz = r.Hz()
+	l.Valid = l.Hz != 0
+	l.Note = "DFS off: the root's own configuration, " + r.String()
+
+	if !l.Valid {
+		l.Note = fmt.Sprintf("DFS off; root CFG selects source %d, whose rate is not known", r.Src)
 	}
 
 	return l
@@ -293,6 +305,11 @@ type BaudPlan struct {
 	Oversampling uint32
 	ActualBaud   float64
 	ErrorPPM     int
+
+	// Direct is set when DFS is off and the plan programs the root
+	// itself (§2.1) to Root; Level is then 0.
+	Direct bool
+	Root   se2clk.Root
 }
 
 // oversampling returns the UART oversampling factor for the wrapper
@@ -307,7 +324,19 @@ func oversampling() (ovs uint32, ver uint32) {
 	return 32, ver
 }
 
-func planBaud(baud int, levels []DFSLevel, ovs uint32) (BaudPlan, error) {
+func planBaud(baud int, levels []DFSLevel, current, ovs uint32) (BaudPlan, error) {
+	if !DFSEnabled(current) {
+		// DFS off (this board): the root's rate is bmx's choice (§4.3)
+		p, err := se2clk.PlanBaud(baud, ovs, se2clk.Table)
+
+		bp := BaudPlan{
+			Baud: baud, Level: 0, LevelHz: p.RootHz, Divider: p.Divider, Oversampling: ovs,
+			ActualBaud: p.ActualBaud, ErrorPPM: p.ErrorPPM, Direct: true, Root: p.Root,
+		}
+
+		return bp, err
+	}
+
 	if baud < 300 || baud > 8000000 {
 		return BaudPlan{}, fmt.Errorf("baud %d outside 300..8000000", baud)
 	}
@@ -381,6 +410,9 @@ type MCUUARTDiag struct {
 	CurrentLevel uint32 // raw DFS current-level register
 
 	Plan BaudPlan // the rate in use
+
+	// Root is the SE2 root's live state (§2.1).
+	Root RootState
 
 	TXDepth, RXDepth uint32 // FIFO depths, words
 
@@ -557,7 +589,7 @@ func (u *GENIFlowUART) startRx() {
 // is read from the wrapper, whose clocks must then already be on.
 func (u *GENIFlowUART) PlanBaud(baud int) (BaudPlan, error) {
 	u.mu.Lock()
-	ready, levels, ovs := u.ready, u.diag.Levels, u.diag.Oversampling
+	ready, levels, cur, ovs := u.ready, u.diag.Levels, u.diag.CurrentLevel, u.diag.Oversampling
 	u.mu.Unlock()
 
 	if !ready {
@@ -566,11 +598,11 @@ func (u *GENIFlowUART) PlanBaud(baud int) (BaudPlan, error) {
 			return BaudPlan{}, errors.New("QUPv3 wrapper 0 clocks are off (bring the link UART up first)")
 		}
 
-		levels, _ = DecodeDFS()
+		levels, cur = DecodeDFS()
 		ovs, _ = oversampling()
 	}
 
-	return planBaud(baud, levels, ovs)
+	return planBaud(baud, levels, cur, ovs)
 }
 
 // Init brings the serial engine up as an 8N1 UART at baud with CTS
@@ -604,7 +636,7 @@ func (u *GENIFlowUART) Init(baud int) error {
 	u.diag.Oversampling, u.diag.WrapperVersion = oversampling()
 	u.diag.Levels, u.diag.CurrentLevel = DecodeDFS()
 
-	plan, err := planBaud(baud, u.diag.Levels, u.diag.Oversampling)
+	plan, err := planBaud(baud, u.diag.Levels, u.diag.CurrentLevel, u.diag.Oversampling)
 	if err != nil {
 		return err
 	}
@@ -677,8 +709,11 @@ func (u *GENIFlowUART) Init(baud int) error {
 	reg.Write(u.Base+SE_UART_LOOPBACK_CFG, 0)
 	reg.Write(u.Base+SE_UART_IO_MACRO_CTRL, 0)
 
-	// 9. rate
-	u.applyPlan(plan)
+	// 9. rate (the receiver is stopped and nothing transmits: the root may
+	// be reprogrammed)
+	if err := u.applyPlan(plan); err != nil {
+		return err
+	}
 
 	// 10. receiver on
 	if u.ring == nil {
@@ -693,7 +728,13 @@ func (u *GENIFlowUART) Init(baud int) error {
 	return nil
 }
 
-func (u *GENIFlowUART) applyPlan(p BaudPlan) {
+func (u *GENIFlowUART) applyPlan(p BaudPlan) error {
+	if p.Direct {
+		if err := programRoot(p.Root); err != nil {
+			return err
+		}
+	}
+
 	clk := p.Divider<<CLK_DIV_SHFT | SER_CLK_EN
 
 	reg.Write(u.Base+GENI_SER_M_CLK_CFG, clk)
@@ -701,6 +742,115 @@ func (u *GENIFlowUART) applyPlan(p BaudPlan) {
 	reg.Write(u.Base+SE_GENI_CLK_SEL, uint32(p.Level)&0x7)
 
 	u.diag.Plan = p
+
+	return nil
+}
+
+// RootState is the SE2 root's registers and what they decode to.
+type RootState struct {
+	CMD, CFG, M, N, D uint32
+	Root              se2clk.Root
+	Hz                uint64
+}
+
+// ReadRoot reads the SE2 root (GCC registers, readable at any time).
+func ReadRoot() RootState {
+	base := uint32(GCC_BASE + GCC_QUP0_S2_CMD_RCGR)
+
+	s := RootState{
+		CMD: reg.Read(base),
+		CFG: reg.Read(base + rootCfgOff),
+		M:   reg.Read(base + rootMOff),
+		N:   reg.Read(base + rootNOff),
+		D:   reg.Read(base + rootDOff),
+	}
+
+	s.Root = se2clk.Decode(s.CFG, s.M, s.N)
+	s.Hz = s.Root.Hz()
+
+	return s
+}
+
+// rootUpdate sets CMD.UPDATE and waits for the hardware to clear it.
+func rootUpdate(base uint32) bool {
+	reg.Write(base, reg.Read(base)|rootCmdUpdate)
+
+	deadline := time.Now().Add(rootUpdateTimeout)
+
+	for reg.Read(base)&rootCmdUpdate != 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// rootRunning waits (up to the update timeout) for CMD.ROOT_OFF to read 0.
+func rootRunning(base uint32) bool {
+	deadline := time.Now().Add(rootUpdateTimeout)
+
+	for reg.Read(base)&rootCmdRootOff != 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// programRoot sets the SE2 root to r (§2.1): M, N, D when M/N is used,
+// then CFG (bits 4:0, 10:8, 13:12 replaced, the rest -- bit 20 hardware
+// control -- kept), then CMD.UPDATE, waiting up to 500 us. A root that is
+// already at r is left alone. On a failed update, or ROOT_OFF after it,
+// the CFG found is restored with another update and the step is named in
+// the error; the engine divider has not been touched at that point, so
+// the link stays at its previous rate. The caller has the engine idle.
+func programRoot(r se2clk.Root) error {
+	base := uint32(GCC_BASE + GCC_QUP0_S2_CMD_RCGR)
+	found := reg.Read(base + rootCfgOff)
+	want := r.CFG(found)
+
+	m, n, d, used := r.MND()
+
+	if found == want && (!used || reg.Read(base+rootMOff)&0xffff == m && reg.Read(base+rootNOff)&0xffff == n &&
+		reg.Read(base+rootDOff)&0xffff == d) {
+		return nil
+	}
+
+	if used {
+		reg.Write(base+rootMOff, m)
+		reg.Write(base+rootNOff, n)
+		reg.Write(base+rootDOff, d)
+	}
+
+	reg.Write(base+rootCfgOff, want)
+
+	step := ""
+
+	switch {
+	case !rootUpdate(base):
+		step = fmt.Sprintf("UPDATE did not complete within %v", rootUpdateTimeout)
+	case !rootRunning(base):
+		step = fmt.Sprintf("ROOT_OFF still set %v after the update: the selected source is not running", rootUpdateTimeout)
+	}
+
+	if step == "" {
+		return nil
+	}
+
+	cmd := reg.Read(base)
+
+	reg.Write(base+rootCfgOff, found)
+	restored := rootUpdate(base) && rootRunning(base)
+
+	note := "restored the previous root CFG"
+	if !restored {
+		note = fmt.Sprintf("restoring the previous root CFG %#08x ALSO FAILED (CMD %#08x)", found, reg.Read(base))
+	}
+
+	return fmt.Errorf("SE2 root to %v (CFG %#08x, M %#x N %#x D %#x): %s (CMD %#08x); %s",
+		r, want, m, n, d, step, cmd, note)
 }
 
 // SetBaud changes the rate. The transmitter is idle (Write is not running:
@@ -714,17 +864,19 @@ func (u *GENIFlowUART) SetBaud(baud int) error {
 		return errors.New("link UART not initialized")
 	}
 
-	plan, err := planBaud(baud, u.diag.Levels, u.diag.Oversampling)
+	plan, err := planBaud(baud, u.diag.Levels, u.diag.CurrentLevel, u.diag.Oversampling)
 	if err != nil {
 		return err
 	}
 
+	// engine idle for the root change: nothing transmits (the lock is
+	// held), the receiver is stopped
 	u.poll()
 	u.stopRx()
-	u.applyPlan(plan)
+	err = u.applyPlan(plan)
 	u.startRx()
 
-	return nil
+	return err
 }
 
 // Baud returns the configured rate (0 before Init).
@@ -950,6 +1102,7 @@ func (u *GENIFlowUART) Diag() MCUUARTDiag {
 
 	d := u.diag
 	d.Initialized = u.ready
+	d.Root = ReadRoot()
 
 	if !u.ready {
 		d.Levels, d.CurrentLevel = DecodeDFS()

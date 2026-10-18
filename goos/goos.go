@@ -117,6 +117,12 @@ var (
 	// implementation for HW/OS threading (e.g. [runtime.newosproc]).
 	Task func(sp, mp, gp, fn unsafe.Pointer)
 
+	// TaskStackSize is an optional variable which can be set to the size
+	// of the stack [runtime.newosproc] allocates for each [Task], when the
+	// default (8 MB) is more than the implementation uses. It must be set
+	// before the first Task call.
+	TaskStackSize uintptr
+
 	// Wake is an optional function which can be set to provide a wake up
 	// call for halted processors as reported by [ProcID], it must be
 	// defined as required to handle [Idle] implementations which halt a
