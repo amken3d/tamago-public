@@ -84,6 +84,7 @@ type camssRoot struct {
 
 var (
 	camssRootTimer  = camssRoot{"csiphy timer (0x45000)", gccCSIPHYTimerCmdRCGR, camssTimerRates}
+	camssRootTimer1 = camssRoot{"csiphy1 timer (0x4501c)", gccCSIPHY1TimerCmdRCGR, camssTimerRates} // §3a: PHY 0's table
 	camssRootCPHYRX = camssRoot{"cphy rx (0x52064)", gccCPHYRXCmdRCGR, camssCPHYRXRates}
 	camssRootCSID   = camssRoot{"tfe0 csid (0x52094)", gccTFE0CSIDCmdRCGR, camssCSIDRates}
 	camssRootTFE    = camssRoot{"tfe0 core (0x52004)", gccTFE0CmdRCGR, camssTFERates}
@@ -123,10 +124,12 @@ func setRoot(r camssRoot, rate camssRate) error {
 // pixel. With the minimums of an OV5647 mode it sets the §2.2 rates.
 // EnableCAMSSClocks must have been called (the branches are on).
 func SetCAMSSRates(linkHz, pixelRate uint64, bpp int) (CAMSSRates, error) {
-	return setCAMSSRates(linkHz, pixelRate, bpp, 0)
+	return setCAMSSRates(0, linkHz, pixelRate, bpp, 0)
 }
 
-func setCAMSSRates(linkHz, pixelRate uint64, bpp int, tfeFloor uint64) (CAMSSRates, error) {
+// setCAMSSRates programs the roots for a capture on PHY phy: that PHY's
+// timer, and the shared CPHY RX, CSID and TFE core roots.
+func setCAMSSRates(phy int, linkHz, pixelRate uint64, bpp int, tfeFloor uint64) (CAMSSRates, error) {
 	var got CAMSSRates
 
 	linkMin := linkHz / 4
@@ -147,7 +150,13 @@ func setCAMSSRates(linkHz, pixelRate uint64, bpp int, tfeFloor uint64) (CAMSSRat
 		return nil
 	}
 
-	if err := set(camssRootTimer, linkMin, &got.TimerHz); err != nil {
+	timer := camssRootTimer
+
+	if phy == 1 {
+		timer = camssRootTimer1
+	}
+
+	if err := set(timer, linkMin, &got.TimerHz); err != nil {
 		return got, err
 	}
 
@@ -189,7 +198,7 @@ type CAMSSRootStatus struct {
 
 // CAMSSRoots reads the scaling roots back from the GCC.
 func CAMSSRoots() (s []CAMSSRootStatus) {
-	for _, r := range []camssRoot{camssRootTimer, camssRootCPHYRX, camssRootCSID, camssRootTFE} {
+	for _, r := range []camssRoot{camssRootTimer, camssRootTimer1, camssRootCPHYRX, camssRootCSID, camssRootTFE} {
 		st := CAMSSRootStatus{
 			Name: r.name,
 			CMD:  reg.Read(GCC_BASE + r.cmd),

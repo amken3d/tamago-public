@@ -26,6 +26,7 @@ import (
 // hardware documentation this driver was written from.
 const (
 	CSIPHY0_BASE = 0x05c52000
+	CSIPHY1_BASE = 0x05c53000 // §3a: the same receiver, at its own base
 	CSID0_BASE   = 0x05c6e000
 	TFE0_BASE    = 0x05c6f000
 )
@@ -40,6 +41,12 @@ const (
 
 	gccCSIPHYTimerCmdRCGR = 0x45000
 	gccCSIPHY0TimerCBCR   = 0x45018
+
+	// CAMERA1's PHY (§3a): its own timer root and branch, and its data
+	// clock branch on the shared CPHY RX root
+	gccCSIPHY1TimerCmdRCGR = 0x4501c
+	gccCSIPHY1TimerCBCR    = 0x45034
+	gccCPHY1CBCR           = 0x5208c
 
 	gccCPHYRXCmdRCGR  = 0x52064 // shared by CPHY 0 and TFE 0 CPHY RX
 	gccCPHY0CBCR      = 0x52088
@@ -120,7 +127,8 @@ func EnableCAMSSClocks() error {
 }
 
 // CAMSSClockStatus returns the CBCR of every capture-path branch, in
-// EnableCAMSSClocks order, for diagnostics (bit 0 enable, bit 31 off).
+// EnableCAMSSClocks order and then PHY 1's two (§3a), for diagnostics
+// (bit 0 enable, bit 31 off).
 func CAMSSClockStatus() []uint32 {
 	var v []uint32
 
@@ -128,6 +136,7 @@ func CAMSSClockStatus() []uint32 {
 		gccCAMSSAXICBCR, gccCAMSSRTAXICBCR, gccCAMSSNRTAXICBCR,
 		gccCSIPHY0TimerCBCR, gccCPHY0CBCR, gccTFE0CPHYRXCBCR,
 		gccTFE0CSIDCBCR, gccTFE0CBCR,
+		gccCSIPHY1TimerCBCR, gccCPHY1CBCR,
 	} {
 		v = append(v, reg.Read(GCC_BASE+cbcr))
 	}
@@ -405,9 +414,10 @@ type CaptureConfig struct {
 	Settle uint32
 	// DT is the CSI-2 data type (RAW10 = 0x2b).
 	DT uint8
-	// Stride and Height give the bytes per frame (Stride x Height); a
-	// RAW10 line is Width x 10 / 8 bytes, and must be a multiple of 4
-	// (§6: for RAW10, a width that is a multiple of 16 pixels).
+	// Stride and Height give the bytes per frame (Stride x Height).
+	// Stride is the line pitch in memory: the line's bytes (a RAW10 line
+	// is Width x 10 / 8) rounded up to 8, the pitch the write master
+	// uses (§6 observation).
 	Stride int
 	Height int
 	// PixelRate is the rate pixels reach the receiver, per second, and
@@ -427,6 +437,11 @@ type CAMSS struct {
 	CSID uint32
 	TFE  uint32
 
+	// PHYIndex is the PHY's number: CSID CSI2_RX_CFG0's PHY select is
+	// PHYIndex + 1 (§4.1), and it picks the PHY's timer root (§2.2.1,
+	// §3a)
+	PHYIndex int
+
 	settle uint32
 	rates  CAMSSRates
 }
@@ -436,6 +451,40 @@ var Camera0 = &CAMSS{
 	PHY:  CSIPHY0_BASE,
 	CSID: CSID0_BASE,
 	TFE:  TFE0_BASE,
+}
+
+// Camera1 is CAMERA1's path: PHY 1 into CSID 0 and TFE 0 (§3a). It shares
+// the CSID and TFE with Camera0, so only one of the two captures at a
+// time.
+var Camera1 = &CAMSS{
+	PHY:      CSIPHY1_BASE,
+	CSID:     CSID0_BASE,
+	TFE:      TFE0_BASE,
+	PHYIndex: 1,
+}
+
+// EnablePHYClocks enables the clocks a PHY needs beyond the §2.2 set,
+// which covers PHY 0: for PHY 1, its timer branch and its CPHY data clock
+// branch (§3a). The timer's root rate is set by Start (§2.2.1). Call it
+// after EnableCAMSSClocks and before the PHY's registers are touched.
+func (c *CAMSS) EnablePHYClocks() error {
+	if c.PHYIndex == 0 {
+		return nil
+	}
+
+	for _, b := range []struct {
+		name string
+		cbcr uint32
+	}{
+		{"csiphy1 timer", gccCSIPHY1TimerCBCR},
+		{"cphy1", gccCPHY1CBCR},
+	} {
+		if err := dispClkOn(GCC_BASE, b.cbcr); err != nil {
+			return fmt.Errorf("%s: %v", b.name, err)
+		}
+	}
+
+	return nil
 }
 
 // Reset performs the power-up part of each block's sequence: the PHY
@@ -527,11 +576,12 @@ func (c *CAMSS) Start(cfg CaptureConfig, buf0, buf1 uint32) error {
 		return errors.New("invalid frame geometry")
 	}
 
-	// A line that is not a whole number of 32-bit words is written short
-	// (§6, hardware observation): refuse it rather than deliver frames
-	// that end early.
-	if cfg.Stride%4 != 0 {
-		return fmt.Errorf("a %d-byte line is not a whole number of 32-bit words: the write master ends such frames early (camss-spec §6)", cfg.Stride)
+	// The write master's plain 64-bit packer lays each line out on an
+	// 8-byte pitch, whatever the line's own length (§6, hardware
+	// observation): Stride must be that pitch, or the frame's layout (and
+	// FRAME_INCR) disagree with what is written.
+	if cfg.Stride%8 != 0 {
+		return fmt.Errorf("stride %d: the write master puts lines on an 8-byte pitch; pass the line's length rounded up to 8 (camss-spec §6)", cfg.Stride)
 	}
 
 	phyLanes := cfg.PHYLanes
@@ -554,7 +604,7 @@ func (c *CAMSS) Start(cfg CaptureConfig, buf0, buf1 uint32) error {
 
 	// the scaling roots for this mode (§2.2.1), before any block is
 	// configured; the settle count is counted in the timer rate set
-	rates, err := setCAMSSRates(cfg.LinkHz, cfg.PixelRate, cfg.BPP, cfg.TFEMinHz)
+	rates, err := setCAMSSRates(c.PHYIndex, cfg.LinkHz, cfg.PixelRate, cfg.BPP, cfg.TFEMinHz)
 
 	if err != nil {
 		return err
@@ -595,7 +645,7 @@ func (c *CAMSS) Start(cfg CaptureConfig, buf0, buf1 uint32) error {
 		laneSel |= uint32(p) << (4 * l)
 	}
 
-	reg.Write(c.CSID+csidRXCfg0, uint32(cfg.Lanes-1)|laneSel<<4|(0+1)<<20)
+	reg.Write(c.CSID+csidRXCfg0, uint32(cfg.Lanes-1)|laneSel<<4|uint32(c.PHYIndex+1)<<20)
 	reg.Write(c.CSID+csidRXCfg1, 1)
 	reg.Write(c.CSID+csidRDICfg0(0), rdiEnable|uint32(cfg.DT&0x3f)<<16|rdiDecodeNone)
 	reg.Write(c.CSID+csidRDICtrl(0), 1)
