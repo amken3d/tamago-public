@@ -212,6 +212,13 @@ func phyRead(off uint32) uint32 {
 	return reg.Read(QUSB2PHY_BASE+off) & 0xff
 }
 
+// PHYRead and PHYWrite read and write an 8-bit QUSB2 PHY register by its
+// offset, for tuning the port at run time (its PORT_TUNE1-4 at 0x80-0x8c
+// set the transmitter's current, pre-emphasis and the receiver's squelch).
+func PHYRead(off uint32) uint32 { return phyRead(off) }
+
+func PHYWrite(off, v uint32) { phyWrite(off, v) }
+
 // usbRCG programs a root clock generator's source and divider fields,
 // keeping the CFG register's other bits, and commits it (§2).
 func usbRCG(cmd, cfg uint32) error {
